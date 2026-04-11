@@ -47,6 +47,8 @@ let fsEpisodePickerIndex = -1;
 let castSession = null;
 let isCastReady = false;
 let runtimeConfig = {};
+const CAST_NAMESPACE = "urn:x-cast:com.echoai.auth";
+let receiverAuthToken = null;
 
 const tooltipEl = document.createElement("div");
 tooltipEl.id = "translateTooltip";
@@ -74,7 +76,11 @@ function formatTime(seconds) {
 }
 
 async function fetchJson(url) {
-  const res = await fetch(url);
+  const headers = {};
+  if (receiverAuthToken) {
+    headers["X-Cast-Token"] = receiverAuthToken;
+  }
+  const res = await fetch(url, { headers });
   if (!res.ok) throw new Error(`Request failed: ${res.status}`);
   return res.json();
 }
@@ -89,6 +95,17 @@ function getCastReceiverAppId() {
 }
 
 async function ensureAuthenticatedSession() {
+  // In receiver mode, try token from query string first (passed by sender).
+  if (receiverMode) {
+    const tokenFromQuery = new URLSearchParams(window.location.search).get("rt");
+    if (tokenFromQuery) {
+      receiverAuthToken = tokenFromQuery;
+      return;
+    }
+    // No token yet — receiver will wait for Cast message in initCastReceiver.
+    return;
+  }
+
   const statusRes = await fetch("/api/auth/status");
   if (!statusRes.ok) {
     throw new Error(`Auth status failed: ${statusRes.status}`);
@@ -229,6 +246,7 @@ function initCastSender() {
       updateCastButtonState();
 
       if (event.sessionState === cast.framework.SessionState.SESSION_STARTED && castSession) {
+        void sendAuthToReceiver(castSession);
         void loadCurrentEpisodeOnCastSession(castSession);
       }
     });
@@ -256,12 +274,70 @@ function initCastSender() {
       castSession = context.getCurrentSession();
       updateCastButtonState();
       if (castSession) {
+        void sendAuthToReceiver(castSession);
         void loadCurrentEpisodeOnCastSession(castSession);
       }
     } catch {
       // User canceled cast dialog or cast failed to start.
     }
   });
+}
+
+async function sendAuthToReceiver(session) {
+  try {
+    // Request a general cast token (episode-agnostic) for the receiver to use.
+    const response = await fetch("/api/cast/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: "_auth" }),
+    });
+    if (!response.ok) return;
+    const data = await response.json();
+    if (data.token) {
+      session.sendMessage(CAST_NAMESPACE, JSON.stringify({ type: "auth", token: data.token }));
+    }
+  } catch {
+    // Best effort — receiver may still work if auth is not required.
+  }
+}
+
+function initCastReceiver() {
+  // In receiver mode, listen for auth messages from the sender.
+  if (!window.cast || !window.cast.framework) return;
+
+  const context = cast.framework.CastReceiverContext.getInstance();
+
+  context.addCustomMessageListener(CAST_NAMESPACE, (event) => {
+    try {
+      const msg = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
+      if (msg.type === "auth" && msg.token) {
+        receiverAuthToken = msg.token;
+        // Re-load episodes now that we have auth.
+        loadEpisodesForReceiver();
+      }
+    } catch {
+      // Ignore malformed messages.
+    }
+  });
+
+  // Start the receiver context so it can receive messages.
+  const options = new cast.framework.CastReceiverOptions();
+  options.customNamespaces = {};
+  options.customNamespaces[CAST_NAMESPACE] = cast.framework.system.MessageType.JSON;
+  context.start(options);
+}
+
+async function loadEpisodesForReceiver() {
+  try {
+    episodes = await fetchJson("/api/episodes");
+    filteredEpisodes = episodes.slice();
+    renderEpisodeList();
+    if (!currentEpisodeId) {
+      openFsEpisodePicker();
+    }
+  } catch {
+    // Token may be invalid or expired.
+  }
 }
 
 function hideTooltip() {
@@ -1239,6 +1315,7 @@ async function init() {
 
     if (receiverMode) {
       enterFullscreen();
+      initCastReceiver();
       if (!currentEpisodeId) {
         openFsEpisodePicker();
       }

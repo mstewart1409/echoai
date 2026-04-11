@@ -257,6 +257,10 @@ def _extract_cast_token_from_request() -> str:
     if token:
         return token
 
+    cast_header = (request.headers.get('X-Cast-Token') or '').strip()
+    if cast_header:
+        return cast_header
+
     bearer = (request.headers.get('Authorization') or '').strip()
     if bearer.startswith('Bearer '):
         return bearer[7:].strip()

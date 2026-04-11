@@ -3,6 +3,9 @@
 # ---------------------------------------------------------------------------
 # Watchtower polls GHCR for new images and automatically restarts the
 # echoai container when a new version is pushed.
+# A single Watchtower instance on the host watches all labeled containers.
+# If Watchtower is not yet running, deploy it separately or uncomment the
+# watchtower service block below.
 # ---------------------------------------------------------------------------
 
 services:
@@ -30,30 +33,19 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
 
-  watchtower:
-    image: containrrr/watchtower
-    container_name: watchtower
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /home/pi/.docker/config.json:/config.json:ro
-    environment:
-      DOCKER_API_VERSION: "1.54"
-      # Poll every 5 minutes (300s)
-      WATCHTOWER_POLL_INTERVAL: 300
-      # Only update containers with the enable label
-      WATCHTOWER_LABEL_ENABLE: "true"
-      # Clean old images after update
-      WATCHTOWER_CLEANUP: "true"
-      # Log level
-      WATCHTOWER_LOG_LEVEL: info
-      # GHCR auth — use a GitHub PAT with read:packages scope
-      # Format: <username>:<PAT>
-      DOCKER_CONFIG: /
-      WATCHTOWER_HTTP_API_METRICS: "false"
-    # GHCR authentication via Docker config (created by docker login)
-    # If you've already run: docker login ghcr.io
-    # then mount the config:
-    #   - ~/.docker/config.json:/config.json:ro
-    # and set:
-    #   DOCKER_CONFIG: /
+  # Uncomment if no Watchtower instance is running on this host:
+  # watchtower:
+  #   image: containrrr/watchtower
+  #   container_name: watchtower
+  #   restart: unless-stopped
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #     - /home/pi/.docker/config.json:/config.json:ro
+  #   environment:
+  #     DOCKER_API_VERSION: "1.54"
+  #     WATCHTOWER_POLL_INTERVAL: 300
+  #     WATCHTOWER_LABEL_ENABLE: "true"
+  #     WATCHTOWER_CLEANUP: "true"
+  #     WATCHTOWER_LOG_LEVEL: info
+  #     DOCKER_CONFIG: /
+  #     WATCHTOWER_HTTP_API_METRICS: "false"

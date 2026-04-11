@@ -61,6 +61,15 @@
     </div>
   </div>
 
+  <script>
+    // Load Cast Receiver SDK when running as a Chromecast receiver.
+    if (new URLSearchParams(window.location.search).get("mode") === "receiver" ||
+        new URLSearchParams(window.location.search).get("receiver") === "1") {
+      var s = document.createElement("script");
+      s.src = "//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js";
+      document.head.appendChild(s);
+    }
+  </script>
   <script src="/static/app.js"></script>
 </body>
 </html>
