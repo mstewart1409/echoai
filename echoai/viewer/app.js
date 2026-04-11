@@ -23,6 +23,92 @@ const fsEpisodePickerListEl = document.getElementById("fsEpisodePickerList");
 const fsEpisodePickerCloseBtnEl = document.getElementById("fsEpisodePickerCloseBtn");
 const urlParams = new URLSearchParams(window.location.search);
 const receiverMode = urlParams.get("mode") === "receiver" || urlParams.get("receiver") === "1";
+const castDebugEnabled = receiverMode || urlParams.get("castDebug") === "1";
+
+// ── Cast Debug Logger ────────────────────────────────────────────────────────
+const CAST_LOG_MAX = 200;
+const castLogEntries = [];
+let castDebugPanelEl = null;
+let castDebugPanelBodyEl = null;
+
+function _ensureCastDebugPanel() {
+  if (castDebugPanelEl) return;
+  castDebugPanelEl = document.createElement("div");
+  castDebugPanelEl.id = "castDebugPanel";
+  castDebugPanelEl.style.cssText =
+    "position:fixed;bottom:0;right:0;width:420px;max-height:45vh;overflow-y:auto;" +
+    "background:rgba(0,0,0,0.88);color:#0f0;font:11px/1.4 monospace;padding:6px 8px;" +
+    "z-index:99999;border-top:2px solid #0f0;border-left:2px solid #0f0;pointer-events:auto;" +
+    "user-select:text;";
+  const header = document.createElement("div");
+  header.style.cssText =
+    "display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;" +
+    "border-bottom:1px solid #0a0;padding-bottom:3px;";
+  header.innerHTML =
+    '<span style="font-weight:bold;color:#0f0">🔊 Cast Debug</span>';
+  const btnGroup = document.createElement("span");
+
+  const copyBtn = document.createElement("button");
+  copyBtn.textContent = "Copy";
+  copyBtn.style.cssText = "margin-left:6px;font-size:10px;cursor:pointer;background:#222;color:#0f0;border:1px solid #0a0;padding:1px 6px;";
+  copyBtn.addEventListener("click", () => {
+    const text = castLogEntries.map((e) => `[${e.ts}] ${e.level} ${e.msg}`).join("\n");
+    navigator.clipboard.writeText(text).catch(() => {});
+  });
+
+  const clearBtn = document.createElement("button");
+  clearBtn.textContent = "Clear";
+  clearBtn.style.cssText = "margin-left:4px;font-size:10px;cursor:pointer;background:#222;color:#0f0;border:1px solid #0a0;padding:1px 6px;";
+  clearBtn.addEventListener("click", () => {
+    castLogEntries.length = 0;
+    if (castDebugPanelBodyEl) castDebugPanelBodyEl.innerHTML = "";
+  });
+
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "✕";
+  closeBtn.style.cssText = "margin-left:4px;font-size:10px;cursor:pointer;background:#222;color:#f44;border:1px solid #a00;padding:1px 6px;";
+  closeBtn.addEventListener("click", () => {
+    castDebugPanelEl.style.display = "none";
+  });
+
+  btnGroup.appendChild(copyBtn);
+  btnGroup.appendChild(clearBtn);
+  btnGroup.appendChild(closeBtn);
+  header.appendChild(btnGroup);
+  castDebugPanelEl.appendChild(header);
+
+  castDebugPanelBodyEl = document.createElement("div");
+  castDebugPanelEl.appendChild(castDebugPanelBodyEl);
+  document.body.appendChild(castDebugPanelEl);
+}
+
+function castLog(level, ...args) {
+  const ts = new Date().toISOString().slice(11, 23);
+  const msg = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
+  const tag = `[Cast/${level}]`;
+
+  if (level === "ERROR") {
+    console.error(tag, ...args);
+  } else if (level === "WARN") {
+    console.warn(tag, ...args);
+  } else {
+    console.log(tag, ...args);
+  }
+
+  castLogEntries.push({ ts, level, msg });
+  if (castLogEntries.length > CAST_LOG_MAX) castLogEntries.shift();
+
+  if (castDebugEnabled) {
+    _ensureCastDebugPanel();
+    const line = document.createElement("div");
+    const color = level === "ERROR" ? "#f44" : level === "WARN" ? "#fa0" : level === "OK" ? "#4f4" : "#0f0";
+    line.style.cssText = `color:${color};word-break:break-all;border-bottom:1px solid #111;padding:1px 0;`;
+    line.textContent = `${ts} ${level} ${msg}`;
+    castDebugPanelBodyEl.appendChild(line);
+    castDebugPanelEl.scrollTop = castDebugPanelEl.scrollHeight;
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 let episodes = [];
 let filteredEpisodes = [];
@@ -49,6 +135,10 @@ let isCastReady = false;
 let runtimeConfig = {};
 const CAST_NAMESPACE = "urn:x-cast:com.echoai.auth";
 let receiverAuthToken = null;
+
+castLog("INFO", "app.js loaded — receiverMode:", receiverMode, "castDebug:", castDebugEnabled);
+castLog("INFO", "userAgent:", navigator.userAgent.substring(0, 120));
+castLog("INFO", "location:", window.location.href);
 
 const tooltipEl = document.createElement("div");
 tooltipEl.id = "translateTooltip";
@@ -81,16 +171,20 @@ async function fetchJson(url) {
     headers["X-Cast-Token"] = receiverAuthToken;
   }
   const res = await fetch(url, { headers });
-  if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+  if (!res.ok) {
+    castLog("ERROR", "fetchJson failed:", url, "status:", res.status);
+    throw new Error(`Request failed: ${res.status}`);
+  }
   return res.json();
 }
 
 function getCastReceiverAppId() {
   const fromQuery = new URLSearchParams(window.location.search).get("receiverAppId");
-  if (fromQuery) return fromQuery;
+  if (fromQuery) { castLog("INFO", "appId from query:", fromQuery); return fromQuery; }
   const fromStorage = localStorage.getItem("castReceiverAppId");
-  if (fromStorage) return fromStorage;
-  if (runtimeConfig.cast_receiver_app_id) return runtimeConfig.cast_receiver_app_id;
+  if (fromStorage) { castLog("INFO", "appId from localStorage:", fromStorage); return fromStorage; }
+  if (runtimeConfig.cast_receiver_app_id) { castLog("INFO", "appId from config:", runtimeConfig.cast_receiver_app_id); return runtimeConfig.cast_receiver_app_id; }
+  castLog("WARN", "using default Cast appId CC1AD845");
   return "CC1AD845"; // Default Media Receiver fallback
 }
 
@@ -150,7 +244,9 @@ async function requestCastSessionToken(episodeId) {
 async function loadRuntimeConfig() {
   try {
     runtimeConfig = await fetchJson('/api/config');
-  } catch {
+    castLog("INFO", "runtimeConfig loaded:", runtimeConfig);
+  } catch (err) {
+    castLog("WARN", "runtimeConfig load failed:", err.message);
     runtimeConfig = {};
   }
 }
@@ -159,6 +255,7 @@ function updateCastButtonState() {
   if (!castBtnEl) return;
   if (!isCastReady) {
     castBtnEl.classList.add("hidden");
+    castLog("INFO", "castBtn hidden — SDK not ready");
     return;
   }
 
@@ -166,6 +263,7 @@ function updateCastButtonState() {
   castBtnEl.classList.remove("hidden");
   castBtnEl.classList.toggle("connected", connected);
   castBtnEl.textContent = connected ? "Casting" : "Cast";
+  castLog("INFO", "castBtn updated — connected:", connected);
 }
 
 function getCurrentEpisodeMeta() {
@@ -184,15 +282,19 @@ function getCurrentEpisodeMeta() {
 
 async function loadCurrentEpisodeOnCastSession(session) {
   const meta = getCurrentEpisodeMeta();
-  if (!meta) return;
+  if (!meta) { castLog("WARN", "loadCurrentEpisodeOnCastSession: no episode meta"); return; }
+
+  castLog("INFO", "loading media on Cast session:", meta.id, meta.mediaUrl);
 
   let mediaUrl = meta.mediaUrl;
   try {
     const token = await requestCastSessionToken(meta.id);
     if (token) {
       mediaUrl = `${meta.mediaUrl}${meta.mediaUrl.includes("?") ? "&" : "?"}rt=${encodeURIComponent(token)}`;
+      castLog("INFO", "cast token appended to media URL");
     }
   } catch (err) {
+    castLog("ERROR", "cast token request failed:", err.message);
     statusTextEl.textContent = err.message;
     return;
   }
@@ -211,28 +313,42 @@ async function loadCurrentEpisodeOnCastSession(session) {
   request.currentTime = audioEl.currentTime || 0;
   request.autoplay = true;
 
-  session.loadMedia(request, () => {}, () => {});
+  castLog("INFO", "sending LoadRequest — currentTime:", request.currentTime);
+  session.loadMedia(request,
+    () => { castLog("OK", "media loaded successfully on receiver"); },
+    (err) => { castLog("ERROR", "loadMedia failed:", err); }
+  );
 }
 
 function initCastSender() {
-  if (!castBtnEl) return;
+  if (!castBtnEl) { castLog("WARN", "initCastSender: castBtnEl not found"); return; }
+  castLog("INFO", "initCastSender called");
 
-  window.__onGCastApiAvailable = function (isAvailable) {
-    if (!isAvailable || !window.cast || !window.cast.framework) {
+  function onCastApiReady() {
+    castLog("INFO", "onCastApiReady — window.cast:", !!window.cast,
+            "framework:", !!(window.cast && window.cast.framework));
+    if (!window.cast || !window.cast.framework) {
+      castLog("WARN", "onCastApiReady: framework not available");
       return;
     }
+    if (isCastReady) { castLog("INFO", "onCastApiReady: already initialized, skipping"); return; }
 
+    const appId = getCastReceiverAppId();
+    castLog("INFO", "setting Cast options — appId:", appId, "autoJoinPolicy: ORIGIN_SCOPED");
     const context = cast.framework.CastContext.getInstance();
     context.setOptions({
-      receiverApplicationId: getCastReceiverAppId(),
+      receiverApplicationId: appId,
       autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED,
     });
 
     isCastReady = true;
     castSession = context.getCurrentSession() || null;
+    castLog("INFO", "Cast SDK ready — existing session:", !!castSession);
+    castLog("INFO", "castState:", context.getCastState());
     updateCastButtonState();
 
     context.addEventListener(cast.framework.CastContextEventType.SESSION_STATE_CHANGED, (event) => {
+      castLog("INFO", "SESSION_STATE_CHANGED:", event.sessionState);
       const activeStates = [
         cast.framework.SessionState.SESSION_STARTING,
         cast.framework.SessionState.SESSION_STARTED,
@@ -243,26 +359,55 @@ function initCastSender() {
         ? context.getCurrentSession()
         : null;
 
+      castLog("INFO", "session active:", !!castSession, "state:", event.sessionState);
       updateCastButtonState();
 
       if (event.sessionState === cast.framework.SessionState.SESSION_STARTED && castSession) {
+        castLog("OK", "new Cast session started — sending auth + loading media");
         void sendAuthToReceiver(castSession);
         void loadCurrentEpisodeOnCastSession(castSession);
       }
+      if (event.sessionState === cast.framework.SessionState.SESSION_ENDED) {
+        castLog("INFO", "Cast session ended");
+      }
     });
+  }
+
+  // Register callback for when Cast SDK loads (normal path).
+  window.__onGCastApiAvailable = function (isAvailable) {
+    castLog("INFO", "__onGCastApiAvailable fired — isAvailable:", isAvailable);
+    if (isAvailable) onCastApiReady();
   };
 
+  // If Chrome's Cast extension already injected the framework, use it now.
+  if (window.cast && window.cast.framework) {
+    castLog("INFO", "Cast framework already present — calling onCastApiReady immediately");
+    onCastApiReady();
+  } else {
+    castLog("INFO", "Cast framework not yet present — waiting for SDK script");
+  }
+
+  // Load the Cast Sender SDK (also triggers __onGCastApiAvailable).
   const script = document.createElement("script");
   script.src = "https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1";
   script.async = true;
+  script.addEventListener("load", () => { castLog("INFO", "cast_sender.js script loaded"); });
+  script.addEventListener("error", (e) => { castLog("ERROR", "cast_sender.js script load FAILED", e.message || ""); });
   document.head.appendChild(script);
 
   castBtnEl.addEventListener("click", async () => {
-    if (!isCastReady || !window.cast || !window.cast.framework) return;
+    castLog("INFO", "castBtn clicked — isCastReady:", isCastReady,
+            "cast:", !!window.cast, "framework:", !!(window.cast && window.cast.framework));
+    if (!isCastReady || !window.cast || !window.cast.framework) {
+      castLog("WARN", "castBtn click ignored — SDK not ready");
+      return;
+    }
 
     const context = cast.framework.CastContext.getInstance();
+    castLog("INFO", "castState:", context.getCastState(), "sessionState:", context.getSessionState());
     const existing = context.getCurrentSession();
     if (existing) {
+      castLog("INFO", "ending existing session");
       existing.endSession(true);
       castSession = null;
       updateCastButtonState();
@@ -270,73 +415,148 @@ function initCastSender() {
     }
 
     try {
+      castLog("INFO", "requesting new Cast session...");
       await context.requestSession();
       castSession = context.getCurrentSession();
+      castLog("OK", "requestSession resolved — session:", !!castSession);
       updateCastButtonState();
       if (castSession) {
         void sendAuthToReceiver(castSession);
         void loadCurrentEpisodeOnCastSession(castSession);
       }
-    } catch {
-      // User canceled cast dialog or cast failed to start.
+    } catch (err) {
+      castLog("WARN", "requestSession failed:", err.code || "", err.description || err.message || err);
     }
   });
 }
 
 async function sendAuthToReceiver(session) {
+  castLog("INFO", "sendAuthToReceiver: waiting 1.5s for receiver startup...");
+  await new Promise((r) => setTimeout(r, 1500));
+
   try {
-    // Request a general cast token (episode-agnostic) for the receiver to use.
+    castLog("INFO", "requesting auth token for receiver (episode_id=_auth)");
     const response = await fetch("/api/cast/session", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ episode_id: "_auth" }),
     });
-    if (!response.ok) return;
+    if (!response.ok) {
+      castLog("ERROR", "auth token request failed:", response.status);
+      return;
+    }
     const data = await response.json();
     if (data.token) {
+      castLog("INFO", "sending auth token to receiver via namespace:", CAST_NAMESPACE);
       session.sendMessage(CAST_NAMESPACE, JSON.stringify({ type: "auth", token: data.token }));
+      castLog("OK", "auth token sent to receiver");
+    } else {
+      castLog("WARN", "auth token response had no token");
     }
-  } catch {
-    // Best effort — receiver may still work if auth is not required.
+  } catch (err) {
+    castLog("ERROR", "sendAuthToReceiver error:", err.message || err);
   }
 }
 
 function initCastReceiver() {
-  // In receiver mode, listen for auth messages from the sender.
-  if (!window.cast || !window.cast.framework) return;
+  castLog("INFO", "initCastReceiver called");
+  const castReceiverContext = window.cast && window.cast.framework &&
+    window.cast.framework.CastReceiverContext;
 
-  const context = cast.framework.CastReceiverContext.getInstance();
+  if (!castReceiverContext) {
+    castLog("WARN", "CastReceiverContext not available yet — retrying in 200ms");
+    setTimeout(initCastReceiver, 200);
+    return;
+  }
 
+  castLog("OK", "CastReceiverContext found — initializing receiver");
+  const context = castReceiverContext.getInstance();
+  const playerManager = context.getPlayerManager();
+
+  // Listen for auth token from sender via custom namespace.
   context.addCustomMessageListener(CAST_NAMESPACE, (event) => {
+    castLog("INFO", "received custom message on namespace:", CAST_NAMESPACE);
     try {
       const msg = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
+      castLog("INFO", "custom message parsed — type:", msg.type, "hasToken:", !!msg.token);
       if (msg.type === "auth" && msg.token) {
         receiverAuthToken = msg.token;
-        // Re-load episodes now that we have auth.
+        castLog("OK", "auth token stored — loading episodes");
         loadEpisodesForReceiver();
       }
-    } catch {
-      // Ignore malformed messages.
+    } catch (err) {
+      castLog("ERROR", "custom message parse error:", err.message);
     }
   });
 
-  // Start the receiver context so it can receive messages.
+  // When media is loaded, extract episode info from customData and load transcript.
+  playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, (request) => {
+    castLog("INFO", "LOAD interceptor fired");
+    const customData = request.media && request.media.customData;
+    if (customData && customData.episodeId) {
+      castLog("INFO", "loading episode from LOAD request:", customData.episodeId);
+      loadEpisode(customData.episodeId).catch((err) => {
+        castLog("ERROR", "loadEpisode from LOAD interceptor failed:", err.message);
+      });
+    } else {
+      castLog("WARN", "LOAD request had no customData.episodeId");
+    }
+    return request;
+  });
+
+  // Track playback time for transcript sync.
+  playerManager.addEventListener(cast.framework.events.EventType.TIME_UPDATE, () => {
+    const mediaStatus = playerManager.getMediaInformation();
+    if (mediaStatus) {
+      const currentTime = playerManager.getCurrentTimeSec();
+      if (Math.abs(audioEl.currentTime - currentTime) > 0.5) {
+        audioEl.currentTime = currentTime;
+      }
+    }
+  });
+
+  playerManager.addEventListener(cast.framework.events.EventType.ERROR, (event) => {
+    castLog("ERROR", "receiver playerManager error:", event.detailedErrorCode || "", event.reason || "");
+  });
+
+  // Start the receiver with the custom namespace registered.
+  castLog("INFO", "starting CastReceiverContext with namespace:", CAST_NAMESPACE);
   const options = new cast.framework.CastReceiverOptions();
   options.customNamespaces = {};
   options.customNamespaces[CAST_NAMESPACE] = cast.framework.system.MessageType.JSON;
   context.start(options);
+  castLog("OK", "CastReceiverContext started");
+
+  // Log receiver system events.
+  context.addEventListener(cast.framework.system.EventType.READY, () => {
+    castLog("OK", "receiver READY event");
+  });
+  context.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, (event) => {
+    castLog("OK", "sender connected:", event.senderId || "");
+  });
+  context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, (event) => {
+    castLog("INFO", "sender disconnected:", event.senderId || "", "reason:", event.reason || "");
+  });
+  context.addEventListener(cast.framework.system.EventType.ERROR, (event) => {
+    castLog("ERROR", "receiver system error:", event.detailedErrorCode || "", event.reason || "");
+  });
+  context.addEventListener(cast.framework.system.EventType.SHUTDOWN, () => {
+    castLog("INFO", "receiver shutdown");
+  });
 }
 
 async function loadEpisodesForReceiver() {
+  castLog("INFO", "loadEpisodesForReceiver called");
   try {
     episodes = await fetchJson("/api/episodes");
+    castLog("OK", "episodes loaded for receiver:", episodes.length);
     filteredEpisodes = episodes.slice();
     renderEpisodeList();
     if (!currentEpisodeId) {
       openFsEpisodePicker();
     }
-  } catch {
-    // Token may be invalid or expired.
+  } catch (err) {
+    castLog("ERROR", "loadEpisodesForReceiver failed:", err.message);
   }
 }
 
@@ -594,16 +814,29 @@ async function loadSegmentTranslation(index, loadToken) {
 
 function ensureActiveSegmentTranslation() {
   if (activeSegmentIndex < 0) return;
-  void loadSegmentTranslation(activeSegmentIndex, activeEpisodeLoadToken);
+  void lazyTranslateAround(activeSegmentIndex, activeEpisodeLoadToken);
 }
 
 async function hydrateSegmentTranslations(loadToken) {
-  if (loadToken !== activeEpisodeLoadToken || !currentSegments.length) return;
+  // Lazy: only translate the active segment and a few neighbours.
+  // Called from ensureActiveSegmentTranslation on each timeupdate.
+  void lazyTranslateAround(activeSegmentIndex, loadToken);
+}
 
-  const indices = [...currentSegments.keys()];
-  if (activeSegmentIndex > 0) {
-    indices.splice(activeSegmentIndex, 1);
-    indices.unshift(activeSegmentIndex);
+async function lazyTranslateAround(center, loadToken) {
+  if (loadToken !== activeEpisodeLoadToken || !currentSegments.length) return;
+  if (center < 0) center = 0;
+
+  // Translate a window of ±3 segments around the currently playing one.
+  const LOOKAHEAD = 3;
+  const start = Math.max(0, center - LOOKAHEAD);
+  const end = Math.min(currentSegments.length - 1, center + LOOKAHEAD);
+
+  // Current segment first, then outward.
+  const indices = [center];
+  for (let d = 1; d <= LOOKAHEAD; d++) {
+    if (center + d <= end) indices.push(center + d);
+    if (center - d >= start) indices.push(center - d);
   }
 
   for (const index of indices) {
@@ -1305,24 +1538,30 @@ translationToggleBtnEl.addEventListener("click", () => {
 // ────────────────────────────────────────────────────────────────────────────
 
 async function init() {
+  castLog("INFO", "init() starting");
   try {
     await ensureAuthenticatedSession();
+    castLog("INFO", "auth session ensured");
     await loadRuntimeConfig();
     episodes = await fetchJson("/api/episodes");
     filteredEpisodes = episodes.slice();
     statusTextEl.textContent = `${episodes.length} episode(s) found.`;
+    castLog("INFO", "episodes loaded:", episodes.length);
     renderEpisodeList();
 
     if (receiverMode) {
+      castLog("INFO", "entering receiver mode");
       enterFullscreen();
       initCastReceiver();
       if (!currentEpisodeId) {
         openFsEpisodePicker();
       }
     } else {
+      castLog("INFO", "entering sender mode");
       initCastSender();
     }
   } catch (err) {
+    castLog("ERROR", "init failed:", err.message);
     statusTextEl.textContent = `Error: ${err.message}`;
   }
 }

@@ -33,6 +33,7 @@ VIEWER_DIR = Path(
 ).resolve()
 SPACY_MODEL = os.getenv('TRANSCRIPT_VIEWER_SPACY_MODEL', 'de_core_news_sm')
 CAST_RECEIVER_APP_ID = os.getenv('TRANSCRIPT_VIEWER_CAST_RECEIVER_APP_ID', 'CC1AD845')
+AUTH_DISABLED = os.getenv('TRANSCRIPT_VIEWER_AUTH_DISABLED', '').strip().lower() in ('1', 'true')
 AUTH_USERNAME = os.getenv(
     'TRANSCRIPT_VIEWER_AUTH_USERNAME', os.getenv('TRANSCRIPT_VIEWER_CAST_BASIC_AUTH_USERNAME', '')
 ).strip()
@@ -127,6 +128,29 @@ TRANSCRIPTS_DIR = _prefer_local_when_configured_empty(
 )
 
 app = Flask(__name__, static_folder=str(VIEWER_DIR), static_url_path='/static')
+
+CSP_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' "
+    'https://www.gstatic.com https://*.gstatic.com https://ajax.googleapis.com; '
+    "style-src 'self' 'unsafe-inline'; "
+    "connect-src 'self' ws://localhost:* wss://localhost:* "
+    'https://translate.googleapis.com; '
+    "media-src 'self' blob:; "
+    "img-src 'self' data: blob:; "
+    "font-src 'self';"
+)
+
+
+@app.after_request
+def apply_csp_headers(response):
+    """Attach Content-Security-Policy to HTML responses for Chromecast receiver compatibility."""
+    content_type = response.content_type or ''
+    if 'text/html' in content_type:
+        response.headers['Content-Security-Policy'] = CSP_POLICY
+    return response
+
+
 TEXT_TRANSLATION_CACHE: dict[str, str] = {}
 ANALYSIS_CACHE: dict[str, dict] = {}
 AUTH_SESSIONS: dict[str, int] = {}
@@ -276,11 +300,14 @@ def _extract_cast_token_from_request() -> str:
 
 @app.before_request
 def require_authentication():
+    if AUTH_DISABLED:
+        return None
+
     # Public entry points for loading the app shell and creating sessions.
     if request.path == '/' or request.path.startswith('/static/'):
         return None
 
-    if request.path in ('/api/auth/status', '/api/auth/login'):
+    if request.path in ('/api/auth/status', '/api/auth/login', '/api/cast/debug'):
         return None
 
     if _validate_auth_session():
@@ -297,8 +324,8 @@ def require_authentication():
 def api_auth_status():
     return jsonify(
         {
-            'authenticated': _validate_auth_session(),
-            'auth_required': _has_auth_credentials_configured(),
+            'authenticated': AUTH_DISABLED or _validate_auth_session(),
+            'auth_required': not AUTH_DISABLED and _has_auth_credentials_configured(),
             'username_hint': AUTH_USERNAME,
         }
     )
@@ -680,12 +707,16 @@ def api_config():
 def api_cast_session():
     payload = request.get_json(silent=True) or {}
     episode_id = str(payload.get('episode_id', '')).strip()
+    logger.info('cast/session requested — episode_id=%s remote=%s', episode_id, request.remote_addr)
     if not episode_id:
+        logger.warning('cast/session: missing episode_id')
         return jsonify({'error': 'episode_id is required'}), 400
     if not CAST_SIGNING_KEY:
+        logger.error('cast/session: signing key not configured')
         return jsonify({'error': 'cast token signing key is not configured'}), 500
 
     token, expires_at = _mint_cast_token(episode_id)
+    logger.info('cast/session: token minted for episode=%s expires_at=%d', episode_id, expires_at)
     return jsonify({'token': token, 'expires_at': expires_at})
 
 
@@ -693,14 +724,77 @@ def api_cast_session():
 def api_cast_validate():
     payload = request.get_json(silent=True) or {}
     token = str(payload.get('token', '')).strip()
+    logger.info(
+        'cast/validate requested — has_token=%s remote=%s', bool(token), request.remote_addr
+    )
     claims = _verify_cast_token(token)
     if not claims:
+        logger.warning('cast/validate: token invalid or expired')
         return jsonify({'valid': False}), 401
 
     expected_episode = str(payload.get('episode_id', '')).strip()
     if expected_episode and claims.get('ep') != expected_episode:
+        logger.warning(
+            'cast/validate: episode mismatch expected=%s got=%s', expected_episode, claims.get('ep')
+        )
         return jsonify({'valid': False}), 403
+    logger.info('cast/validate: token valid — claims=%s', claims)
     return jsonify({'valid': True, 'claims': claims})
+
+
+@app.get('/api/cast/debug')
+def api_cast_debug():
+    """Diagnostic endpoint returning cast configuration and runtime state."""
+    now = int(time.time())
+    with AUTH_SESSIONS_LOCK:
+        active_sessions = sum(1 for exp in AUTH_SESSIONS.values() if exp > now)
+        total_sessions = len(AUTH_SESSIONS)
+
+    return jsonify(
+        {
+            'cast': {
+                'receiver_app_id': CAST_RECEIVER_APP_ID,
+                'signing_key_configured': bool(CAST_SIGNING_KEY),
+                'token_ttl_seconds': CAST_TOKEN_TTL_SECONDS,
+                'token_required_for_media': CAST_TOKEN_REQUIRED_FOR_MEDIA,
+                'custom_namespace': 'urn:x-cast:com.echoai.auth',
+            },
+            'auth': {
+                'disabled': AUTH_DISABLED,
+                'username_configured': bool(AUTH_USERNAME),
+                'password_configured': bool(AUTH_PASSWORD),
+                'session_secret_configured': bool(AUTH_SESSION_SECRET),
+                'session_cookie_name': AUTH_SESSION_COOKIE_NAME,
+                'session_ttl_seconds': AUTH_SESSION_TTL_SECONDS,
+                'active_sessions': active_sessions,
+                'total_sessions': total_sessions,
+            },
+            'paths': {
+                'downloads_dir': str(DOWNLOADS_DIR),
+                'downloads_exists': DOWNLOADS_DIR.exists(),
+                'transcripts_dir': str(TRANSCRIPTS_DIR),
+                'transcripts_exists': TRANSCRIPTS_DIR.exists(),
+                'viewer_dir': str(VIEWER_DIR),
+                'viewer_exists': VIEWER_DIR.exists(),
+                'index_html_exists': (VIEWER_DIR / 'index.html').exists(),
+            },
+            'content': {
+                'mp3_count': len(list(DOWNLOADS_DIR.glob('*.mp3')))
+                if DOWNLOADS_DIR.exists()
+                else 0,
+                'json_count': len(list(TRANSCRIPTS_DIR.glob('*.json')))
+                if TRANSCRIPTS_DIR.exists()
+                else 0,
+                'srt_count': len(list(TRANSCRIPTS_DIR.glob('*.srt')))
+                if TRANSCRIPTS_DIR.exists()
+                else 0,
+            },
+            'csp_policy': CSP_POLICY,
+            'server_time': now,
+            'request_remote_addr': request.remote_addr,
+            'request_host': request.host,
+        }
+    )
 
 
 @app.get('/api/episode/<episode_id>')
