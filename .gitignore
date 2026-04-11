@@ -1,0 +1,36 @@
+# Secrets
+.env
+
+# Telethon session files
+*.session
+*.session-journal
+scraper_session*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+transcripts/
+downloads/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+logs/
+
+# Tests
+.coverage

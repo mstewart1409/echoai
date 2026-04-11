@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# Reusable deploy workflow
+# ---------------------------------------------------------------------------
+# Builds the Docker image and pushes to GitHub Container Registry.
+# Called by deploy-dev.yml and deploy-prod.yml with environment-specific
+# configuration passed as inputs.
+# ---------------------------------------------------------------------------
+
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target environment (dev | prod)"
+        required: true
+        type: string
+      image_tag_prefix:
+        description: "Docker image tag prefix (dev | prod)"
+        required: true
+        type: string
+      ref:
+        description: "Git ref to checkout (leave empty for default)"
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  # ------------------------------------------------------------------
+  # Build & push to GHCR
+  # ------------------------------------------------------------------
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      environment: ${{ inputs.environment }}
+      image_tag: ${{ inputs.image_tag_prefix }}-${{ github.sha }}
+      ref: ${{ inputs.ref }}
+    permissions:
+      contents: read
+      packages: write

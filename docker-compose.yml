@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# echoai — Docker Compose with Watchtower auto-update
+# ---------------------------------------------------------------------------
+# Watchtower polls GHCR for new images and automatically restarts the
+# echoai container when a new version is pushed.
+# ---------------------------------------------------------------------------
+
+services:
+  echoai:
+    image: ghcr.io/mstewart1409/echoai:latest
+    container_name: echoai
+    restart: unless-stopped
+    # .env contains secrets — ensure chmod 600 .env on the host
+    env_file: .env
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./downloads:/app/downloads
+      - ./transcripts:/app/transcripts
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/pi/.docker/config.json:/config.json:ro
+    environment:
+      DOCKER_API_VERSION: "1.54"
+      # Poll every 5 minutes (300s)
+      WATCHTOWER_POLL_INTERVAL: 300
+      # Only update containers with the enable label
+      WATCHTOWER_LABEL_ENABLE: "true"
+      # Clean old images after update
+      WATCHTOWER_CLEANUP: "true"
+      # Log level
+      WATCHTOWER_LOG_LEVEL: info
+      # GHCR auth — use a GitHub PAT with read:packages scope
+      # Format: <username>:<PAT>
+      DOCKER_CONFIG: /
+      WATCHTOWER_HTTP_API_METRICS: "false"
+    # GHCR authentication via Docker config (created by docker login)
+    # If you've already run: docker login ghcr.io
+    # then mount the config:
+    #   - ~/.docker/config.json:/config.json:ro
+    # and set:
+    #   DOCKER_CONFIG: /

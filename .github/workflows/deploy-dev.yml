@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# Deploy to DEV environment
+# ---------------------------------------------------------------------------
+# Triggered on push to develop or manual dispatch.
+# Runs the release workflow FIRST (beta pre-release), then builds and
+# pushes the Docker image to GitHub Container Registry.
+# ---------------------------------------------------------------------------
+
+name: Deploy → Dev
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------
+  # Step 1: Beta pre-release (version bump + tag)
+  # ------------------------------------------------------------------
+  release:
+    if: "!startsWith(github.event.head_commit.message, 'bump:')"
+    uses: ./.github/workflows/release.yml
+    with:
+      prerelease: beta
+    secrets: inherit
+    permissions:
+      contents: write
+
+  # ------------------------------------------------------------------
+  # Step 2: Build & push to GHCR
+  # ------------------------------------------------------------------
+  deploy:
+    needs: release
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.release.result != 'failure'
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: dev
+      image_tag_prefix: dev
+    permissions:
+      contents: read
+      packages: write

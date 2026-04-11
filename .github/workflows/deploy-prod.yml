@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# Deploy to PROD environment
+# ---------------------------------------------------------------------------
+# Triggered on push to main or manual dispatch.
+# Runs the release workflow FIRST (version bump + tag), then builds and
+# pushes the Docker image to GitHub Container Registry.
+# ---------------------------------------------------------------------------
+
+name: Deploy → Prod
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------------------------
+  # Step 1: Version bump, tag, changelog, GitHub Release
+  # ------------------------------------------------------------------
+  release:
+    # Skip commitizen's own bump commits to prevent loops
+    if: "!startsWith(github.event.head_commit.message, 'bump:')"
+    uses: ./.github/workflows/release.yml
+    with:
+      prerelease: ""
+    secrets: inherit
+    permissions:
+      contents: write
+
+  # ------------------------------------------------------------------
+  # Step 2: Build & push to GHCR
+  # ------------------------------------------------------------------
+  deploy:
+    needs: release
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.release.result != 'failure'
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: prod
+      image_tag_prefix: prod
+      ref: main
+    permissions:
+      contents: read
+      packages: write

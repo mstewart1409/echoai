@@ -1,0 +1,174 @@
+# ---------------------------------------------------------------------------
+# Release workflow — version bump, tag, changelog, GitHub Release
+# ---------------------------------------------------------------------------
+# Reusable workflow called by deploy-prod.yml or deploy-dev.yml to bump
+# version BEFORE deployment.  Can also be triggered manually.
+#
+# Uses commitizen to determine the next semver version from conventional
+# commits, updates CHANGELOG.md, tags the repo, and creates a GitHub
+# Release.
+#
+# Pre-release support:
+#   - Pass prerelease=beta from deploy-dev to produce 0.9.0b0 tags.
+#   - Pass prerelease="" (default) from deploy-prod for stable releases.
+#   - When triggered manually, choose alpha/beta/rc from the dropdown.
+#   - If no prerelease is specified, auto-detects from branch:
+#       main → stable,  develop → beta,  other → alpha.
+#
+# The bump commit is pushed with GITHUB_TOKEN, which intentionally does
+# NOT re-trigger push-based workflows (preventing infinite loops).
+# ---------------------------------------------------------------------------
+
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      increment:
+        description: "Version increment (leave empty for auto-detect)"
+        required: false
+        type: string
+        default: ""
+      prerelease:
+        description: "Pre-release identifier (alpha/beta/rc, empty for stable)"
+        required: false
+        type: string
+        default: ""
+    outputs:
+      bumped:
+        description: "Whether a version bump occurred"
+        value: ${{ jobs.release.outputs.bumped }}
+      version:
+        description: "The new version (if bumped)"
+        value: ${{ jobs.release.outputs.version }}
+  workflow_dispatch:
+    inputs:
+      increment:
+        description: "Version increment (leave empty for auto-detect from commits)"
+        required: false
+        default: ""
+        type: choice
+        options:
+          - ""
+          - major
+          - minor
+          - patch
+      prerelease:
+        description: "Pre-release identifier (empty for stable release)"
+        required: false
+        default: ""
+        type: choice
+        options:
+          - ""
+          - alpha
+          - beta
+          - rc
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Skip commitizen's own bump commits to prevent loops
+    if: "!startsWith(github.event.head_commit.message, 'bump:')"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+      version: ${{ steps.bump.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          fetch-depth: 0  # Full history for commitizen tag analysis
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # ----------------------------------------------------------------
+      # Resolve pre-release identifier
+      # ----------------------------------------------------------------
+      # Explicit input wins.  When empty, auto-detect from branch:
+      #   main → stable (no prerelease)
+      #   develop → beta
+      #   anything else → alpha
+      # ----------------------------------------------------------------
+      - name: Resolve prerelease
+        id: prerelease
+        run: |
+          PRERELEASE="${{ inputs.prerelease }}"
+          if [ -z "$PRERELEASE" ]; then
+            BRANCH="${GITHUB_REF#refs/heads/}"
+            case "$BRANCH" in
+              main)    PRERELEASE="" ;;
+              develop) PRERELEASE="beta" ;;
+              *)       PRERELEASE="alpha" ;;
+            esac
+          fi
+          echo "value=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+          if [ -n "$PRERELEASE" ]; then
+            echo "### 🏷️ Pre-release: \`${PRERELEASE}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### 🏷️ Stable release" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Bump version
+        id: bump
+        run: |
+          ARGS="--changelog --yes"
+
+          INCREMENT="${{ inputs.increment }}"
+          if [ -n "$INCREMENT" ]; then
+            ARGS="$ARGS --increment $INCREMENT"
+          fi
+
+          PRERELEASE="${{ steps.prerelease.outputs.value }}"
+          if [ -n "$PRERELEASE" ]; then
+            ARGS="$ARGS --prerelease $PRERELEASE"
+          fi
+
+          if uv run cz bump $ARGS; then
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+            VERSION=$(uv run cz version --project)
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "### ✅ Bumped to ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            echo "### ℹ️ No version bump needed" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Push version bump
+        if: steps.bump.outputs.bumped == 'true'
+        run: git push --follow-tags
+
+      - name: Create GitHub Release
+        if: steps.bump.outputs.bumped == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          PRERELEASE: ${{ steps.prerelease.outputs.value }}
+        run: |
+          PRERELEASE_FLAG=""
+          if [ -n "$PRERELEASE" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "${VERSION}" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            --verify-tag \
+            $PRERELEASE_FLAG

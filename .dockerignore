@@ -1,0 +1,36 @@
+.git
+.github
+.idea
+.venv
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.pyo
+
+# Database / sessions
+*.db
+*.db-shm
+*.db-wal
+*.session
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Not needed in production image
+tests/
+scripts/
+service/
+logs/
+downloads/
+transcripts/
+
+# Misc
+*.md
+!README.md
+.pre-commit-config.yaml
+.secrets.baseline
+Thumbs.db
+Desktop.ini

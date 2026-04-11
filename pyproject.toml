@@ -1,0 +1,99 @@
+[project]
+name = "echoai"
+version = "0.2.0"
+description = ""
+authors = [{ name = "Michael Stewart", email = "m.n.stewart@live.co.uk" }]
+readme = "README.md"
+requires-python = ">=3.14"
+license = {text = "Proprietary"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "beautifulsoup4>=4.13.5,<5",
+    "flask>=3.1.2,<4",
+    "openai-whisper",
+    "python-dotenv>=1.1.1,<2",
+    "requests>=2.32.5,<3",
+    "spacy>=3.8.7,<4",
+    "tqdm>=4.67.1,<5",
+]
+
+[project.urls]
+Repository = "https://github.com/mstewart1409/echoai"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "pytest-cov>=6.0",
+    "pre-commit==4.5.1",
+    "commitizen==4.13.9",
+    "toml>=0.10.2,<0.11",
+    "ruff==0.15.5",
+    "detect-secrets>=1.5.0",
+]
+test = [
+    "pytest>=9.0",
+    "pytest-cov>=6.0",
+]
+
+[tool.hatch.build.targets.sdist]
+include = ["echoai"]
+
+[tool.hatch.build.targets.wheel]
+include = ["echoai"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+exclude-newer = "1 day"
+required-environments = [
+    "sys_platform == 'win32'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    "tests"
+]
+
+[tool.ruff.lint]
+ignore = []
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "single"
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.2.0"
+version_files = [
+    "echoai/__init__.py:__version__",
+    "pyproject.toml:^version"
+]
+tag_format = "$version"
+update_changelog_on_bump = true
+changelog_file = "CHANGELOG.md"
+major_version_zero = true
+annotated_tag = true
+pre_bump_hooks = [
+    "uv lock"
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+omit = ["tests/*"]

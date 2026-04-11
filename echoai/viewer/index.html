@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Easy German Transcript Viewer</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Easy German Transcript Viewer</h1>
+    <p id="statusText">Loading episodes...</p>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <label for="searchInput" class="visually-hidden">Search episodes</label>
+      <input id="searchInput" type="text" placeholder="Search episode id..." />
+      <div id="episodeList" class="episode-list"></div>
+    </aside>
+
+    <section class="content">
+      <div class="player-row">
+        <h2 id="episodeTitle">Select an episode</h2>
+        <div class="button-group">
+          <button id="translationToggleBtn" title="Toggle English translations" class="active">📖 Translations</button>
+          <button id="castBtn" title="Cast to Chromecast" class="cast-btn hidden">Cast</button>
+          <button id="fullscreenBtn" title="Enter fullscreen transcript">⛶ Fullscreen</button>
+        </div>
+      </div>
+
+      <audio id="audioPlayer" controls preload="metadata"></audio>
+
+      <div class="hint" id="syncHint">Transcript sync loads when a timed transcript exists.</div>
+
+      <div id="transcriptViewer" class="transcript-viewer"></div>
+    </section>
+  </main>
+
+  <!-- Fullscreen overlay -->
+  <div id="fsOverlay" class="hidden">
+    <div id="fsProgressBarTrack">
+      <div id="fsProgressBarFill"></div>
+    </div>
+    <button id="fsExitBtn">✕ Exit</button>
+    <div id="fsTranscript"></div>
+    <div id="receiverControls" aria-label="Playback controls">
+      <button id="receiverPrevBtn" type="button" aria-label="Previous segment">Prev</button>
+      <button id="receiverToggleBtn" type="button" aria-label="Play or pause">Play</button>
+      <button id="receiverNextBtn" type="button" aria-label="Next segment">Next</button>
+      <button id="receiverEpisodesBtn" type="button" aria-label="Choose episode">Episodes</button>
+    </div>
+    <div id="fsEpisodePicker" class="hidden" aria-label="Episode picker" aria-modal="true" role="dialog">
+      <div class="picker-panel">
+        <div class="picker-header">
+          <h3>Choose Episode</h3>
+          <button id="fsEpisodePickerCloseBtn" type="button" aria-label="Close episode picker">Close</button>
+        </div>
+        <div id="fsEpisodePickerList" class="picker-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
+

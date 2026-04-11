@@ -1,0 +1,155 @@
+# ---------------------------------------------------------------------------
+# Lint & test workflow
+# ---------------------------------------------------------------------------
+# Runs ruff linting and pytest with coverage on every push and PR.
+# Posts results and coverage summary to PRs.
+# ---------------------------------------------------------------------------
+
+name: Lint & Test
+
+on:
+  push:
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  lint-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      # ----------------------------------------------------------------
+      # Python toolchain
+      # ----------------------------------------------------------------
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libmagic1
+
+      - name: Install Python dependencies
+        run: uv sync --frozen
+
+      # ----------------------------------------------------------------
+      # Dependency vulnerability audit
+      # ----------------------------------------------------------------
+      - name: Audit dependencies for known vulnerabilities
+        run: uv audit
+
+      # ----------------------------------------------------------------
+      # Regenerate secrets baseline so paths and detections match Linux
+      # ----------------------------------------------------------------
+      - name: Sync secrets baseline
+        run: |
+          uv run detect-secrets scan --baseline .secrets.baseline
+          git add .secrets.baseline
+
+      # ----------------------------------------------------------------
+      # Lint — run all pre-commit hooks except pytest
+      # ----------------------------------------------------------------
+      - name: Run pre-commit (lint)
+        env:
+          SKIP: pytest
+        run: uv run pre-commit run --all-files
+
+      # ----------------------------------------------------------------
+      # Ruff JUnit report (for PR check annotations)
+      # ----------------------------------------------------------------
+      - name: Ruff lint (JUnit report)
+        if: always()
+        run: |
+          mkdir -p logs/lint
+          uv run ruff check . \
+            --output-format junit \
+            --output-file logs/lint/ruff-results.xml \
+            --exit-zero
+
+      - name: Publish linter results
+        if: always()
+        uses: EnricoMi/publish-unit-test-result-action@c950f6fb443cb5af20a377fd0dfaa78838901040  # v2
+        with:
+          junit_files: logs/lint/ruff-results.xml
+          check_name: Linter Results
+
+      # ----------------------------------------------------------------
+      # Test — pytest with coverage
+      # ----------------------------------------------------------------
+      - name: Run pytest with coverage
+        id: pytest
+        continue-on-error: true
+        run: |
+          mkdir -p logs/pytest
+          uv run pytest \
+            --junitxml=logs/pytest/pytest-results.xml \
+            --cov=safe_cuties \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            | tee pytest-coverage.txt
+
+      # ----------------------------------------------------------------
+      # Publish test & coverage results
+      # ----------------------------------------------------------------
+      - name: Publish pytest results
+        if: always()
+        uses: EnricoMi/publish-unit-test-result-action@c950f6fb443cb5af20a377fd0dfaa78838901040  # v2
+        with:
+          junit_files: logs/pytest/pytest-results.xml
+          check_name: Pytest Results
+
+      - name: Post pytest & coverage comment
+        if: github.event_name == 'pull_request'
+        uses: MishaKav/pytest-coverage-comment@287292879eaaff04116f36d3eb1a670f6e5df1a4  # v1.7.1
+        with:
+          pytest-coverage-path: pytest-coverage.txt
+          junitxml-path: logs/pytest/pytest-results.xml
+
+      - name: Code coverage summary
+        if: always() && hashFiles('coverage.xml') != ''
+        uses: irongut/CodeCoverageSummary@51cc3a756ddcd398d447c044c02cb6aa83fdae95  # v1.3.0
+        with:
+          filename: coverage.xml
+          badge: true
+          fail_below_min: false
+          format: markdown
+          hide_branch_rate: false
+          hide_complexity: true
+          indicators: true
+          output: both
+          thresholds: '50 75'
+
+      - name: Post coverage summary comment
+        if: github.event_name == 'pull_request' && hashFiles('code-coverage-results.md') != ''
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405  # v2.9.4
+        with:
+          recreate: true
+          path: code-coverage-results.md
+
+      - name: Coverage report (changed files only)
+        if: github.event_name == 'pull_request'
+        uses: romeovs/lcov-reporter-action@dda1c9b1fa1622b225e9acd87a248751dbcc6ada  # v0.3.1
+        with:
+          lcov-file: coverage.lcov
+          delete-old-comments: true
+          filter-changed-files: true
+          title: Coverage — changed files
+
+      - name: Fail if tests failed
+        if: steps.pytest.outcome == 'failure'
+        run: exit 1
