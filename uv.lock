@@ -8,7 +8,7 @@ required-markers = [
 ]
 
 [options]
-exclude-newer = "2026-04-10T21:33:03.478329254Z"
+exclude-newer = "2026-04-10T22:11:41.0433763Z"
 exclude-newer-span = "P1D"
 
 [[package]]
@@ -396,13 +396,10 @@ name = "echoai"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
-    { name = "beautifulsoup4" },
     { name = "flask" },
-    { name = "openai-whisper" },
     { name = "python-dotenv" },
     { name = "requests" },
     { name = "spacy" },
-    { name = "tqdm" },
 ]
 
 [package.dev-dependencies]
@@ -415,6 +412,11 @@ dev = [
     { name = "ruff" },
     { name = "toml" },
 ]
+scripts = [
+    { name = "beautifulsoup4" },
+    { name = "openai-whisper" },
+    { name = "tqdm" },
+]
 test = [
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -422,13 +424,10 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "beautifulsoup4", specifier = ">=4.13.5,<5" },
     { name = "flask", specifier = ">=3.1.2,<4" },
-    { name = "openai-whisper" },
     { name = "python-dotenv", specifier = ">=1.1.1,<2" },
     { name = "requests", specifier = ">=2.32.5,<3" },
     { name = "spacy", specifier = ">=3.8.7,<4" },
-    { name = "tqdm", specifier = ">=4.67.1,<5" },
 ]
 
 [package.metadata.requires-dev]
@@ -440,6 +439,11 @@ dev = [
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "ruff", specifier = "==0.15.5" },
     { name = "toml", specifier = ">=0.10.2,<0.11" },
+]
+scripts = [
+    { name = "beautifulsoup4", specifier = ">=4.13.5,<5" },
+    { name = "openai-whisper" },
+    { name = "tqdm", specifier = ">=4.67.1,<5" },
 ]
 test = [
     { name = "pytest", specifier = ">=9.0" },

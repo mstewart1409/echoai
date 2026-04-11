@@ -45,7 +45,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libmagic1
 
       - name: Install Python dependencies
-        run: uv sync --frozen
+        run: uv sync --frozen --no-group scripts
 
       # ----------------------------------------------------------------
       # Dependency vulnerability audit
@@ -98,7 +98,7 @@ jobs:
           mkdir -p logs/pytest
           uv run pytest \
             --junitxml=logs/pytest/pytest-results.xml \
-            --cov=safe_cuties \
+            --cov=echoai \
             --cov-report=term-missing \
             --cov-report=xml:coverage.xml \
             | tee pytest-coverage.txt
