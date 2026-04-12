@@ -135,7 +135,8 @@ CSP_POLICY = (
     'https://www.gstatic.com https://*.gstatic.com https://ajax.googleapis.com; '
     "style-src 'self' 'unsafe-inline'; "
     "connect-src 'self' ws://localhost:* wss://localhost:* "
-    'https://translate.googleapis.com; '
+    'https://translate.googleapis.com '
+    'https://*.google.com https://*.googleapis.com https://*.gstatic.com; '
     "media-src 'self' blob:; "
     "img-src 'self' data: blob:; "
     "font-src 'self';"

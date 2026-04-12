@@ -260,10 +260,23 @@ function updateCastButtonState() {
   }
 
   const connected = !!castSession;
+  const context = cast.framework.CastContext.getInstance();
+  const castState = context.getCastState();
+
   castBtnEl.classList.remove("hidden");
   castBtnEl.classList.toggle("connected", connected);
-  castBtnEl.textContent = connected ? "Casting" : "Cast";
-  castLog("INFO", "castBtn updated — connected:", connected);
+
+  if (connected) {
+    castBtnEl.textContent = "Casting";
+  } else if (castState === cast.framework.CastState.NOT_CONNECTED) {
+    castBtnEl.textContent = "Cast";
+  } else if (castState === cast.framework.CastState.NO_DEVICES_AVAILABLE) {
+    castBtnEl.textContent = "Cast";
+  } else {
+    castBtnEl.textContent = "Cast";
+  }
+
+  castLog("INFO", "castBtn updated — connected:", connected, "castState:", castState);
 }
 
 function getCurrentEpisodeMeta() {
@@ -344,8 +357,14 @@ function initCastSender() {
     isCastReady = true;
     castSession = context.getCurrentSession() || null;
     castLog("INFO", "Cast SDK ready — existing session:", !!castSession);
-    castLog("INFO", "castState:", context.getCastState());
+    castLog("INFO", "initial castState:", context.getCastState());
     updateCastButtonState();
+
+    // Track device availability changes — discovery is async and can take seconds.
+    context.addEventListener(cast.framework.CastContextEventType.CAST_STATE_CHANGED, (event) => {
+      castLog("INFO", "CAST_STATE_CHANGED:", event.castState);
+      updateCastButtonState();
+    });
 
     context.addEventListener(cast.framework.CastContextEventType.SESSION_STATE_CHANGED, (event) => {
       castLog("INFO", "SESSION_STATE_CHANGED:", event.sessionState);
@@ -373,27 +392,20 @@ function initCastSender() {
     });
   }
 
-  // Register callback for when Cast SDK loads (normal path).
+  // Register callback for when Cast SDK loads.
   window.__onGCastApiAvailable = function (isAvailable) {
     castLog("INFO", "__onGCastApiAvailable fired — isAvailable:", isAvailable);
     if (isAvailable) onCastApiReady();
   };
 
-  // If Chrome's Cast extension already injected the framework, use it now.
+  // Cast Sender SDK is loaded statically from <head>.  If it already injected
+  // the framework by the time we get here, initialise immediately.
   if (window.cast && window.cast.framework) {
     castLog("INFO", "Cast framework already present — calling onCastApiReady immediately");
     onCastApiReady();
   } else {
-    castLog("INFO", "Cast framework not yet present — waiting for SDK script");
+    castLog("INFO", "Cast framework not yet present — waiting for __onGCastApiAvailable callback");
   }
-
-  // Load the Cast Sender SDK (also triggers __onGCastApiAvailable).
-  const script = document.createElement("script");
-  script.src = "https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1";
-  script.async = true;
-  script.addEventListener("load", () => { castLog("INFO", "cast_sender.js script loaded"); });
-  script.addEventListener("error", (e) => { castLog("ERROR", "cast_sender.js script load FAILED", e.message || ""); });
-  document.head.appendChild(script);
 
   castBtnEl.addEventListener("click", async () => {
     castLog("INFO", "castBtn clicked — isCastReady:", isCastReady,
@@ -404,7 +416,9 @@ function initCastSender() {
     }
 
     const context = cast.framework.CastContext.getInstance();
-    castLog("INFO", "castState:", context.getCastState(), "sessionState:", context.getSessionState());
+    const castState = context.getCastState();
+    castLog("INFO", "castState:", castState, "sessionState:", context.getSessionState());
+
     const existing = context.getCurrentSession();
     if (existing) {
       castLog("INFO", "ending existing session");
@@ -412,6 +426,10 @@ function initCastSender() {
       castSession = null;
       updateCastButtonState();
       return;
+    }
+
+    if (castState === cast.framework.CastState.NO_DEVICES_AVAILABLE) {
+      castLog("WARN", "no Cast devices discovered yet — requesting session anyway (Chrome may prompt)");
     }
 
     try {
@@ -425,7 +443,18 @@ function initCastSender() {
         void loadCurrentEpisodeOnCastSession(castSession);
       }
     } catch (err) {
-      castLog("WARN", "requestSession failed:", err.code || "", err.description || err.message || err);
+      const code = err && (err.code || "");
+      const desc = err && (err.description || err.message || String(err));
+      castLog("WARN", "requestSession failed — code:", code, "description:", desc);
+
+      if (code === "cancel") {
+        castLog("INFO", "user cancelled the Cast device picker");
+      } else if (castState === cast.framework.CastState.NO_DEVICES_AVAILABLE) {
+        castLog("ERROR", "no Cast devices found. Ensure: (1) Chromecast is on the same network, " +
+                "(2) receiver app " + getCastReceiverAppId() + " is published or device is registered for development, " +
+                "(3) Chrome has Cast support enabled");
+        statusTextEl.textContent = "No Cast devices found on your network.";
+      }
     }
   });
 }

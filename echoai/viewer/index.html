@@ -3,18 +3,26 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self';
-                 script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.gstatic.com https://*.gstatic.com https://ajax.googleapis.com;
-                 style-src 'self' 'unsafe-inline';
-                 connect-src 'self' ws://localhost:* wss://localhost:* https://translate.googleapis.com;
-                 media-src 'self' blob:;
-                 img-src 'self' data: blob:;
-                 font-src 'self';" />
+  <!-- CSP is enforced via HTTP header from Flask — no <meta> tag needed. -->
   <title>Easy German Transcript Viewer</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
+  <!--
+    Load the Cast SDK statically before app.js so Chrome's Cast infrastructure
+    has time to discover devices.  Sender vs Receiver is decided at load time.
+  -->
+  <script>
+    (function() {
+      var params = new URLSearchParams(window.location.search);
+      var isReceiver = params.get("mode") === "receiver" || params.get("receiver") === "1";
+      if (isReceiver) {
+        document.write('<script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"><\/script>');
+      } else {
+        document.write('<script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"><\/script>');
+      }
+    })();
+  </script>
   <header class="topbar">
     <h1>Easy German Transcript Viewer</h1>
     <p id="statusText">Loading episodes...</p>
@@ -69,16 +77,6 @@
     </div>
   </div>
 
-  <script>
-    // Load Cast Receiver SDK when running as a Chromecast receiver.
-    // Must be synchronous so it's ready before app.js initializes.
-    (function() {
-      var params = new URLSearchParams(window.location.search);
-      if (params.get("mode") === "receiver" || params.get("receiver") === "1") {
-        document.write('<script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"><\/script>');
-      }
-    })();
-  </script>
   <script src="/static/app.js"></script>
 </body>
 </html>
