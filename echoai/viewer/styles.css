@@ -23,6 +23,13 @@ body {
 }
 .topbar h1 { margin: 0; font-size: 20px; }
 .topbar p { margin: 4px 0 0; color: #4b5563; font-size: 13px; }
+.app-version {
+  font-size: 12px;
+  font-weight: 500;
+  color: #6b7280;
+  vertical-align: middle;
+  margin-left: 6px;
+}
 .layout {
   display: grid;
   grid-template-columns: 210px 1fr;

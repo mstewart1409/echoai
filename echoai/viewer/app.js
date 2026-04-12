@@ -172,6 +172,50 @@ let runtimeConfig = {};
 const CAST_NAMESPACE = "urn:x-cast:com.echoai.auth";
 let receiverAuthToken = null;
 
+// ── Bidirectional Cast sync state ────────────────────────────────────────────
+let remotePlayer = null;
+let remotePlayerController = null;
+let castTimeSyncInterval = null;
+
+/** Whether we have an active Cast session with a connected remote player. */
+function _isCasting() {
+  return !!(remotePlayerController && remotePlayer?.isConnected);
+}
+
+/**
+ * Seek to a time.  When casting, seek both the local (muted) audioEl — which
+ * drives transcript tracking via its native timeupdate — and the Chromecast.
+ */
+function _seekTo(time, autoPlay = true) {
+  audioEl.currentTime = time;
+  if (autoPlay && audioEl.paused) audioEl.play();
+  if (_isCasting()) {
+    remotePlayer.currentTime = time;
+    remotePlayerController.seek();
+    // When the user clicks a segment to play from that position, also resume
+    // the remote if it was paused — otherwise the local muted audio advances
+    // while the remote stays still, and the 2s drift correction keeps snapping
+    // the local position back, creating a janky loop.
+    if (autoPlay && remotePlayer.isPaused) {
+      remotePlayerController.playOrPause();
+    }
+  }
+}
+
+/** Mute the sender's local audio element when a Cast session starts. */
+function _muteSenderForCast() {
+  if (receiverMode) return;
+  audioEl.muted = true;
+  castLog("INFO", "sender audio muted for casting");
+}
+
+/** Unmute the sender's local audio element when casting ends. */
+function _unmuteSenderForCast() {
+  if (receiverMode) return;
+  audioEl.muted = false;
+  castLog("INFO", "sender audio unmuted — casting ended");
+}
+
 // In receiver mode, strip native audio controls and remove from tab order so
 // the Google TV D-pad can never focus the browser's built-in media player UI.
 if (receiverMode) {
@@ -289,6 +333,10 @@ async function loadRuntimeConfig() {
   try {
     runtimeConfig = await fetchJson('/api/config');
     castLog("INFO", "runtimeConfig loaded:", runtimeConfig);
+    if (runtimeConfig.version) {
+      const versionEl = document.getElementById("appVersion");
+      if (versionEl) versionEl.textContent = `v${runtimeConfig.version}`;
+    }
   } catch (err) {
     castLog("WARN", "runtimeConfig load failed:", err.message);
     runtimeConfig = {};
@@ -377,6 +425,85 @@ async function loadCurrentEpisodeOnCastSession(session) {
   );
 }
 
+// ── Bidirectional Cast sync helpers ──────────────────────────────────────────
+
+/**
+ * Set up RemotePlayer + RemotePlayerController so the sender tracks receiver
+ * media state (play/pause, seek).  Also listens for custom namespace messages
+ * (episode changes) from the receiver.
+ */
+function setupCastSync(session) {
+  teardownCastSync();
+
+  if (!window.cast || !window.cast.framework) return;
+
+  remotePlayer = new cast.framework.RemotePlayer();
+  remotePlayerController = new cast.framework.RemotePlayerController(remotePlayer);
+  castLog("INFO", "RemotePlayer + Controller created");
+
+  // Mirror remote play/pause to local audioEl — the local element plays muted
+  // so its timeupdate event drives transcript tracking naturally.
+  remotePlayerController.addEventListener(
+    cast.framework.RemotePlayerEventType.IS_PAUSED_CHANGED,
+    () => {
+      castLog("INFO", "remote IS_PAUSED_CHANGED — paused:", remotePlayer.isPaused);
+      if (remotePlayer.isPaused) {
+        audioEl.pause();
+      } else if (audioEl.paused) {
+        audioEl.play();
+      }
+    }
+  );
+
+  // On discrete receiver-side seeks, snap local audioEl to match.
+  remotePlayerController.addEventListener(
+    cast.framework.RemotePlayerEventType.CURRENT_TIME_CHANGED,
+    () => {
+      if (Math.abs(audioEl.currentTime - remotePlayer.currentTime) > 1) {
+        audioEl.currentTime = remotePlayer.currentTime;
+      }
+    }
+  );
+
+  // Lightweight drift correction — the local muted audioEl may drift slightly
+  // from the receiver over time.  Every 2s, snap it back if the gap exceeds 1s.
+  castTimeSyncInterval = setInterval(() => {
+    if (!remotePlayer?.isConnected) return;
+    const drift = Math.abs(audioEl.currentTime - remotePlayer.currentTime);
+    if (drift > 1) {
+      castLog("INFO", "drift correction:", drift.toFixed(1), "s");
+      audioEl.currentTime = remotePlayer.currentTime;
+    }
+  }, 2000);
+
+  // Listen for custom namespace messages from the receiver (e.g. episode changes).
+  session.addMessageListener(CAST_NAMESPACE, (_namespace, messageStr) => {
+    try {
+      const msg = typeof messageStr === "string" ? JSON.parse(messageStr) : messageStr;
+      castLog("INFO", "sender received Cast message — type:", msg.type);
+      if (msg.type === "episodeChanged" && msg.episodeId) {
+        castLog("INFO", "receiver changed episode to:", msg.episodeId);
+        loadEpisode(msg.episodeId, { skipCastLoad: true });
+      }
+    } catch (err) {
+      castLog("ERROR", "sender Cast message parse error:", err.message);
+    }
+  });
+
+  castLog("OK", "Cast bidirectional sync established");
+}
+
+/** Tear down RemotePlayerController and stop the periodic time sync. */
+function teardownCastSync() {
+  if (castTimeSyncInterval) {
+    clearInterval(castTimeSyncInterval);
+    castTimeSyncInterval = null;
+  }
+  remotePlayer = null;
+  remotePlayerController = null;
+  castLog("INFO", "Cast sync torn down");
+}
+
 function initCastSender() {
   if (!castBtnEl) { castLog("WARN", "initCastSender: castBtnEl not found"); return; }
   castLog("INFO", "initCastSender called");
@@ -427,11 +554,20 @@ function initCastSender() {
 
       if (event.sessionState === cast.framework.SessionState.SESSION_STARTED && castSession) {
         castLog("OK", "new Cast session started — sending auth + loading media");
+        _muteSenderForCast();
+        setupCastSync(castSession);
         void sendAuthToReceiver(castSession);
         void loadCurrentEpisodeOnCastSession(castSession);
       }
+      if (event.sessionState === cast.framework.SessionState.SESSION_RESUMED && castSession) {
+        castLog("OK", "Cast session resumed — restoring sync");
+        _muteSenderForCast();
+        setupCastSync(castSession);
+      }
       if (event.sessionState === cast.framework.SessionState.SESSION_ENDED) {
         castLog("INFO", "Cast session ended");
+        teardownCastSync();
+        _unmuteSenderForCast();
       }
     });
   }
@@ -485,13 +621,9 @@ function initCastSender() {
     try {
       castLog("INFO", "requesting new Cast session...");
       await context.requestSession();
-      castSession = context.getCurrentSession();
-      castLog("OK", "requestSession resolved — session:", !!castSession);
-      updateCastButtonState();
-      if (castSession) {
-        void sendAuthToReceiver(castSession);
-        void loadCurrentEpisodeOnCastSession(castSession);
-      }
+      castLog("OK", "requestSession resolved — session:", !!context.getCurrentSession());
+      // Session setup (mute, sync, auth, media load) is handled by the
+      // SESSION_STATE_CHANGED → SESSION_STARTED handler above.
     } catch (err) {
       const code = err && (err.code || "");
       const desc = err && (err.description || err.message || String(err));
@@ -601,6 +733,13 @@ function initCastReceiver() {
         receiverAuthToken = msg.token;
         castLog("OK", "auth token stored — loading episodes");
         loadEpisodesForReceiver();
+        // If a LOAD already fired before auth arrived, the transcript fetch
+        // would have failed (no token → 401).  Re-load the episode now that
+        // we have the token so the transcript is displayed.
+        if (currentEpisodeId) {
+          castLog("INFO", "re-loading current episode after auth:", currentEpisodeId);
+          loadEpisode(currentEpisodeId, { skipAudioSrc: true });
+        }
       }
     } catch (err) {
       castLog("ERROR", "custom message parse error:", err.message);
@@ -616,9 +755,10 @@ function initCastReceiver() {
     const customData = request.media && request.media.customData;
     if (customData && customData.episodeId) {
       castLog("INFO", "loading transcript for episode:", customData.episodeId);
-      loadEpisode(customData.episodeId).catch((err) => {
-        castLog("ERROR", "loadEpisode from LOAD interceptor failed:", err.message);
-      });
+      // The framework will set audioEl.src from the LOAD request's contentUrl
+      // via setMediaElement — tell loadEpisode to skip the src assignment.
+      loadEpisode(customData.episodeId, { skipAudioSrc: true })
+        .catch((err) => { castLog("ERROR", "loadEpisode from LOAD interceptor failed:", err.message); });
     } else {
       castLog("WARN", "LOAD request had no customData.episodeId");
     }
@@ -689,8 +829,34 @@ function initCastReceiver() {
   });
 }
 
+
+/**
+ * Notify the connected sender that the receiver changed episodes.
+ * Only sends when running as a Cast receiver with an active sender connection.
+ */
+function notifySenderEpisodeChanged(episodeId) {
+  if (!receiverMode) return;
+  try {
+    const ctx = window.cast && window.cast.framework &&
+      window.cast.framework.CastReceiverContext &&
+      window.cast.framework.CastReceiverContext.getInstance();
+    if (!ctx) return;
+    ctx.sendCustomMessage(CAST_NAMESPACE, undefined, {
+      type: "episodeChanged",
+      episodeId,
+    });
+    castLog("OK", "sent episodeChanged to sender:", episodeId);
+  } catch (err) {
+    castLog("WARN", "notifySenderEpisodeChanged failed:", err.message);
+  }
+}
+
 async function loadEpisodesForReceiver() {
   castLog("INFO", "loadEpisodesForReceiver called");
+  if (episodes.length) {
+    castLog("INFO", "episodes already loaded — skipping");
+    return;
+  }
   try {
     await loadRuntimeConfig();
     episodes = await fetchJson("/api/episodes");
@@ -867,8 +1033,7 @@ function appendInteractiveText(container, text, segmentIndex = -1) {
 
       wordEl.addEventListener("click", (e) => {
         e.stopPropagation();   // don't bubble to segment row
-        audioEl.currentTime = w.start;
-        if (audioEl.paused) audioEl.play();
+        _seekTo(w.start);
       });
 
       attachWordHover(wordEl, trimmed, text);
@@ -1016,7 +1181,10 @@ function renderEpisodeList() {
 
     item.appendChild(title);
     item.appendChild(meta);
-    item.addEventListener("click", () => loadEpisode(ep.id));
+    item.addEventListener("click", async () => {
+      await loadEpisode(ep.id);
+      if (receiverMode) notifySenderEpisodeChanged(ep.id);
+    });
     episodeListEl.appendChild(item);
   }
 }
@@ -1086,6 +1254,7 @@ async function selectEpisodeFromFsPicker() {
   if (!ep) return;
   closeFsEpisodePicker();
   await loadEpisode(ep.id);
+  if (receiverMode) notifySenderEpisodeChanged(ep.id);
 }
 
 function renderSegments(segments) {
@@ -1112,8 +1281,7 @@ function renderSegments(segments) {
     row.appendChild(text);
     appendSegmentCaption(row, seg.translation_en, "segment-caption");
     row.addEventListener("click", () => {
-      audioEl.currentTime = seg.start;
-      if (audioEl.paused) audioEl.play();
+      _seekTo(seg.start);
     });
 
     transcriptViewerEl.appendChild(row);
@@ -1171,8 +1339,7 @@ function renderWords(words) {
         if (e.target && e.target.classList && e.target.classList.contains("word")) {
           return;
         }
-        audioEl.currentTime = rowStart;
-        if (audioEl.paused) audioEl.play();
+        _seekTo(rowStart);
       });
       container.appendChild(currentRow);
     }
@@ -1190,8 +1357,7 @@ function renderWords(words) {
 
     wordEl.textContent = word.word;
     wordEl.addEventListener("click", () => {
-      audioEl.currentTime = word.start;
-      if (audioEl.paused) audioEl.play();
+      _seekTo(word.start);
     });
 
     attachWordHover(wordEl, word.word.trim(), context);
@@ -1275,7 +1441,7 @@ function updateActiveWord() {
    }
 }
 
-async function loadEpisode(id) {
+async function loadEpisode(id, { skipCastLoad = false, skipAudioSrc = false } = {}) {
   const loadToken = ++activeEpisodeLoadToken;
   currentEpisodeId = id;
   closeFsEpisodePicker();
@@ -1296,13 +1462,20 @@ async function loadEpisode(id) {
 
     episodeTitleEl.textContent = data.title;
 
-    // In receiver mode the Cast framework loads the authenticated media URL
-    // (with ?rt= token) into audioEl via setMediaElement — don't overwrite it.
-    if (!receiverMode) {
-      audioEl.src = data.audio;
+    // Set audio source — unless the Cast framework is already loading media
+    // via setMediaElement (LOAD interceptor passes skipAudioSrc: true).
+    if (!skipAudioSrc) {
+      if (receiverMode && receiverAuthToken) {
+        const sep = data.audio.includes("?") ? "&" : "?";
+        audioEl.src = `${data.audio}${sep}rt=${encodeURIComponent(receiverAuthToken)}`;
+      } else {
+        audioEl.src = data.audio;
+      }
     }
 
-    if (castSession) {
+    // Send LOAD to Chromecast — unless this call originated from the receiver
+    // (which already has the episode loaded) to prevent an echo loop.
+    if (castSession && !skipCastLoad) {
       loadCurrentEpisodeOnCastSession(castSession);
     }
 
@@ -1395,8 +1568,7 @@ function appendFsInteractiveText(container, text, segmentIndex = -1) {
 
       wordEl.addEventListener("click", (e) => {
         e.stopPropagation();   // don't bubble to segment row
-        audioEl.currentTime = w.start;
-        if (audioEl.paused) audioEl.play();
+        _seekTo(w.start);
       });
 
       attachWordHover(wordEl, trimmed, text);
@@ -1433,8 +1605,7 @@ function renderFsSegments(segments) {
     row.appendChild(text);
     appendSegmentCaption(row, seg.translation_en, "fs-segment-caption");
     row.addEventListener("click", () => {
-      audioEl.currentTime = seg.start;
-      if (audioEl.paused) audioEl.play();
+      _seekTo(seg.start);
     });
     fsTranscriptEl.appendChild(row);
   }
@@ -1456,8 +1627,7 @@ function renderFsWords(words) {
       currentRow.dataset.start = String(rowStart);
       currentRow.addEventListener("click", (e) => {
         if (e.target && e.target.classList && e.target.classList.contains("fs-word")) return;
-        audioEl.currentTime = rowStart;
-        if (audioEl.paused) audioEl.play();
+        _seekTo(rowStart);
       });
       fsTranscriptEl.appendChild(currentRow);
     }
@@ -1471,8 +1641,7 @@ function renderFsWords(words) {
     }
     wordEl.textContent = word.word;
     wordEl.addEventListener("click", () => {
-      audioEl.currentTime = word.start;
-      if (audioEl.paused) audioEl.play();
+      _seekTo(word.start);
     });
     attachWordHover(wordEl, word.word.trim(), context);
     currentRow.appendChild(wordEl);
@@ -1500,8 +1669,7 @@ function seekToSegment(index) {
   const target = Math.max(0, Math.min(index, currentSegments.length - 1));
   const seg = currentSegments[target];
   if (!seg) return;
-  audioEl.currentTime = seg.start;
-  if (audioEl.paused) audioEl.play();
+  _seekTo(seg.start);
 }
 
 function jumpToNextSegment() {
@@ -1531,6 +1699,10 @@ function togglePlayPause() {
     audioEl.play();
   } else {
     audioEl.pause();
+  }
+  // Mirror to Chromecast when casting.
+  if (_isCasting()) {
+    remotePlayerController.playOrPause();
   }
 }
 
@@ -1651,7 +1823,8 @@ function updateFsActiveWord() {
 fsProgressTrackEl.addEventListener("click", (e) => {
   if (!audioEl.duration) return;
   const rect = fsProgressTrackEl.getBoundingClientRect();
-  audioEl.currentTime = ((e.clientX - rect.left) / rect.width) * audioEl.duration;
+  const time = ((e.clientX - rect.left) / rect.width) * audioEl.duration;
+  _seekTo(time, false);
 });
 
 if (fsExitBtnEl) fsExitBtnEl.addEventListener("click", exitFullscreen);
@@ -1731,13 +1904,30 @@ async function init() {
   castLog("INFO", "init() starting");
   try {
     if (receiverMode) {
-      // Receiver mode: set up Cast receiver FIRST, then wait for auth token
-      // from the sender before loading any data.  The sender sends a signed
-      // token via the custom Cast namespace; loadEpisodesForReceiver() is
-      // called once the token arrives (see initCastReceiver listener).
-      castLog("INFO", "entering receiver mode — deferring data load until auth token arrives");
+      castLog("INFO", "entering receiver mode");
       enterFullscreen();
+
+      // Set up Cast receiver for real Chromecast (auth token arrives via
+      // namespace → loadEpisodesForReceiver).  In a regular browser the SDK
+      // won't be found and initCastReceiver retries harmlessly.
       initCastReceiver();
+
+      // Also try to load episodes immediately using cookie auth — this works
+      // when testing in a browser.  On actual Chromecast (no cookies) this
+      // will 401, which is fine; the Cast auth token flow handles it.
+      if (!episodes.length) {
+        castLog("INFO", "attempting eager episode load (cookie auth)");
+        try {
+          await loadRuntimeConfig();
+          episodes = await fetchJson("/api/episodes");
+          filteredEpisodes = episodes.slice();
+          castLog("OK", "eager load succeeded:", episodes.length, "episodes");
+          renderEpisodeList();
+        } catch (err) {
+          castLog("INFO", "eager load failed (expected on Chromecast):", err.message);
+        }
+      }
+
       if (!currentEpisodeId) {
         openFsEpisodePicker();
       }
@@ -1821,6 +2011,11 @@ if (fsEpisodePickerCloseBtnEl) {
 // Every handled branch calls stopPropagation + preventDefault to prevent the
 // browser/system from showing the native audio player bar or seeking the audio
 // via built-in controls.
+
+// ── Long-press Enter/Space tracking for debug panel toggle ──────────────
+let _enterLongPressTimer = null;
+let _enterDidLongPress = false;
+
 document.addEventListener("keydown", async (e) => {
   if (!isFullscreen) return;
 
@@ -1844,11 +2039,13 @@ document.addEventListener("keydown", async (e) => {
   if (e.key === "MediaPlay") {
     consume();
     if (audioEl.paused) audioEl.play();
+    if (_isCasting() && remotePlayer.isPaused) remotePlayerController.playOrPause();
     return;
   }
   if (e.key === "MediaPause") {
     consume();
     if (!audioEl.paused) audioEl.pause();
+    if (_isCasting() && !remotePlayer.isPaused) remotePlayerController.playOrPause();
     return;
   }
   if (e.key === "MediaTrackNext") {
@@ -1874,19 +2071,19 @@ document.addEventListener("keydown", async (e) => {
       moveFsEpisodePicker(1);
       return;
     }
+    // Enter/Space in picker: handled via the keydown/keyup long-press logic
+    // below (short press → select episode, long press → debug panel).
     if (e.code === "Enter" || e.code === "Space") {
-      consume();
-      await selectEpisodeFromFsPicker();
-      return;
-    }
-    if (e.code === "Escape" || e.key === "GoBack" || e.code === "Backspace") {
+      // Fall through to the long-press Enter handler below.
+    } else if (e.code === "Escape" || e.key === "GoBack" || e.code === "Backspace") {
       consume();
       if (currentEpisodeId) closeFsEpisodePicker();
       return;
+    } else {
+      // Swallow any other key while picker is open to prevent native handling.
+      consume();
+      return;
     }
-    // Swallow any other key while picker is open to prevent native handling.
-    consume();
-    return;
   }
 
   // ── Playback controls (D-pad) ──────────────────────────────────────
@@ -1900,9 +2097,18 @@ document.addEventListener("keydown", async (e) => {
     jumpToNextSegment();
     return;
   }
+  // Enter/Space: short press → play/pause, long press → debug panel.
+  // We start a timer on keydown; keyup decides whether it was short or long.
   if (e.code === "Enter" || e.code === "Space") {
     consume();
-    togglePlayPause();
+    if (!_enterLongPressTimer && !_enterDidLongPress) {
+      _enterDidLongPress = false;
+      _enterLongPressTimer = setTimeout(() => {
+        _enterDidLongPress = true;
+        _enterLongPressTimer = null;
+        toggleCastDebugPanel();
+      }, LONG_PRESS_MS);
+    }
     return;
   }
   if (e.code === "ArrowUp") {
@@ -1925,6 +2131,30 @@ document.addEventListener("keydown", async (e) => {
   // the native audio element or trigger system-level media controls.
   if (receiverMode) {
     consume();
+  }
+}, /* capture */ true);
+
+
+document.addEventListener("keyup", (e) => {
+  if (!isFullscreen) return;
+  if (e.code === "Enter" || e.code === "Space") {
+    e.preventDefault();
+    e.stopPropagation();
+    if (_enterLongPressTimer) {
+      // Released before the long-press threshold — treat as short press.
+      clearTimeout(_enterLongPressTimer);
+      _enterLongPressTimer = null;
+      if (isFsEpisodePickerOpen) {
+        // Picker is open — select the highlighted episode.
+        selectEpisodeFromFsPicker();
+      } else if (!currentEpisodeId) {
+        // No episode loaded — open the picker so the user can choose one.
+        openFsEpisodePicker();
+      } else {
+        togglePlayPause();
+      }
+    }
+    _enterDidLongPress = false;
   }
 }, /* capture */ true);
 

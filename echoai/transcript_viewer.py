@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 
 from flask import Flask, jsonify, make_response, request, send_from_directory
 
+from echoai import __version__
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BASE_DIR = PROJECT_ROOT
 load_dotenv(PROJECT_ROOT / '.env')
@@ -157,7 +159,8 @@ app = Flask(__name__, static_folder=str(VIEWER_DIR), static_url_path='/static')
 CSP_POLICY = (
     "default-src 'self'; "
     "script-src 'self' 'unsafe-inline' 'unsafe-eval' "
-    'https://www.gstatic.com https://*.gstatic.com https://ajax.googleapis.com '
+    'https://www.gstatic.com https://*.gstatic.com '
+    'https://ajax.googleapis.com '
     'https://static.cloudflareinsights.com; '
     "style-src 'self' 'unsafe-inline'; "
     "connect-src 'self' ws://localhost:* wss://localhost:* "
@@ -788,6 +791,7 @@ def api_episodes():
 @app.get('/api/config')
 def api_config():
     result = {
+        'version': __version__,
         'cast_receiver_app_id': CAST_RECEIVER_APP_ID,
         'auth_required': _is_cast_basic_auth_enabled(),
     }
