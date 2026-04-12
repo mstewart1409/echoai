@@ -132,11 +132,13 @@ app = Flask(__name__, static_folder=str(VIEWER_DIR), static_url_path='/static')
 CSP_POLICY = (
     "default-src 'self'; "
     "script-src 'self' 'unsafe-inline' 'unsafe-eval' "
-    'https://www.gstatic.com https://*.gstatic.com https://ajax.googleapis.com; '
+    'https://www.gstatic.com https://*.gstatic.com https://ajax.googleapis.com '
+    'https://static.cloudflareinsights.com; '
     "style-src 'self' 'unsafe-inline'; "
     "connect-src 'self' ws://localhost:* wss://localhost:* "
     'https://translate.googleapis.com '
-    'https://*.google.com https://*.googleapis.com https://*.gstatic.com; '
+    'https://*.google.com https://*.googleapis.com https://*.gstatic.com '
+    'https://*.cloudflareinsights.com; '
     "media-src 'self' blob:; "
     "img-src 'self' data: blob:; "
     "font-src 'self';"

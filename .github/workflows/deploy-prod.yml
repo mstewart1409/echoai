@@ -45,6 +45,7 @@ jobs:
       environment: prod
       image_tag_prefix: prod
       ref: main
+      version: ${{ needs.release.outputs.version }}
     permissions:
       contents: read
       packages: write

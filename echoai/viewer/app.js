@@ -398,13 +398,19 @@ function initCastSender() {
     if (isAvailable) onCastApiReady();
   };
 
-  // Cast Sender SDK is loaded statically from <head>.  If it already injected
-  // the framework by the time we get here, initialise immediately.
+  // Chrome's built-in Cast extension may have already loaded the framework.
+  // Only inject cast_sender.js manually if it hasn't.
   if (window.cast && window.cast.framework) {
-    castLog("INFO", "Cast framework already present — calling onCastApiReady immediately");
+    castLog("INFO", "Cast framework already present (Chrome extension) — using it directly");
     onCastApiReady();
   } else {
-    castLog("INFO", "Cast framework not yet present — waiting for __onGCastApiAvailable callback");
+    castLog("INFO", "Cast framework not present — loading cast_sender.js dynamically");
+    const script = document.createElement("script");
+    script.src = "https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1";
+    script.async = true;
+    script.addEventListener("load", () => { castLog("INFO", "cast_sender.js loaded"); });
+    script.addEventListener("error", (e) => { castLog("ERROR", "cast_sender.js load FAILED", e.message || ""); });
+    document.head.appendChild(script);
   }
 
   castBtnEl.addEventListener("click", async () => {

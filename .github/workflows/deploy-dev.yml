@@ -43,6 +43,7 @@ jobs:
     with:
       environment: dev
       image_tag_prefix: dev
+      version: ${{ needs.release.outputs.version }}
     permissions:
       contents: read
       packages: write

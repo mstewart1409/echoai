@@ -24,6 +24,11 @@ on:
         required: false
         type: string
         default: ''
+      version:
+        description: "Semver version to tag the image with (optional, e.g. 0.3.0)"
+        required: false
+        type: string
+        default: ''
     outputs:
       image_uri:
         description: "Full GHCR image URI"
@@ -62,18 +67,23 @@ jobs:
           REGISTRY: ghcr.io
           IMAGE_NAME: ${{ github.repository }}
           IMAGE_TAG: ${{ inputs.image_tag }}
+          VERSION: ${{ inputs.version }}
         run: |
           IMAGE_NAME_LOWER=$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')
           IMAGE_URI="${REGISTRY}/${IMAGE_NAME_LOWER}:${IMAGE_TAG}"
           BUILD_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+          TAGS="--tag ${IMAGE_URI} --tag ${REGISTRY}/${IMAGE_NAME_LOWER}:latest"
+          if [ -n "${VERSION}" ]; then
+            TAGS="${TAGS} --tag ${REGISTRY}/${IMAGE_NAME_LOWER}:${VERSION}"
+          fi
+
           docker buildx build \
-            --platform linux/amd64,linux/arm64 \
+            --platform linux/arm64 \
             --build-arg BUILD_ID=${{ github.sha }} \
             --build-arg BUILD_TIMESTAMP="${BUILD_TS}" \
             --build-arg GIT_BRANCH=${{ github.ref_name }} \
-            --tag "${IMAGE_URI}" \
-            --tag "${REGISTRY}/${IMAGE_NAME_LOWER}:latest" \
+            ${TAGS} \
             --push \
             .
 

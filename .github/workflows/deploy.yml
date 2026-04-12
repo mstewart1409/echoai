@@ -24,6 +24,11 @@ on:
         required: false
         type: string
         default: ''
+      version:
+        description: "Semver version to tag the image with (optional)"
+        required: false
+        type: string
+        default: ''
 
 jobs:
   # ------------------------------------------------------------------
@@ -35,6 +40,7 @@ jobs:
       environment: ${{ inputs.environment }}
       image_tag: ${{ inputs.image_tag_prefix }}-${{ github.sha }}
       ref: ${{ inputs.ref }}
+      version: ${{ inputs.version }}
     permissions:
       contents: read
       packages: write

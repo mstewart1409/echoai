@@ -9,17 +9,15 @@
 </head>
 <body>
   <!--
-    Load the Cast SDK statically before app.js so Chrome's Cast infrastructure
-    has time to discover devices.  Sender vs Receiver is decided at load time.
+    Cast Receiver SDK must load synchronously before app.js on Chromecast devices.
+    Cast Sender SDK is NOT loaded here — Chrome's built-in Cast extension provides
+    it automatically.  app.js loads it dynamically only when the extension is absent.
   -->
   <script>
     (function() {
       var params = new URLSearchParams(window.location.search);
-      var isReceiver = params.get("mode") === "receiver" || params.get("receiver") === "1";
-      if (isReceiver) {
+      if (params.get("mode") === "receiver" || params.get("receiver") === "1") {
         document.write('<script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"><\/script>');
-      } else {
-        document.write('<script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"><\/script>');
       }
     })();
   </script>
