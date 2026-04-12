@@ -23,7 +23,7 @@ const fsEpisodePickerListEl = document.getElementById("fsEpisodePickerList");
 const fsEpisodePickerCloseBtnEl = document.getElementById("fsEpisodePickerCloseBtn");
 const urlParams = new URLSearchParams(window.location.search);
 const receiverMode = urlParams.get("mode") === "receiver" || urlParams.get("receiver") === "1";
-const castDebugEnabled = receiverMode || urlParams.get("castDebug") === "1";
+const castDebugEnabled = urlParams.get("castDebug") === "1";
 
 // ── Cast Debug Logger ────────────────────────────────────────────────────────
 const CAST_LOG_MAX = 200;
@@ -31,26 +31,23 @@ const castLogEntries = [];
 let castDebugPanelEl = null;
 let castDebugPanelBodyEl = null;
 
+let castDebugFullscreen = false;
+
 function _ensureCastDebugPanel() {
   if (castDebugPanelEl) return;
   castDebugPanelEl = document.createElement("div");
   castDebugPanelEl.id = "castDebugPanel";
-  castDebugPanelEl.style.cssText =
-    "position:fixed;bottom:0;right:0;width:420px;max-height:45vh;overflow-y:auto;" +
-    "background:rgba(0,0,0,0.88);color:#0f0;font:11px/1.4 monospace;padding:6px 8px;" +
-    "z-index:99999;border-top:2px solid #0f0;border-left:2px solid #0f0;pointer-events:auto;" +
-    "user-select:text;";
+  castDebugPanelEl.className = "cast-debug-panel";
   const header = document.createElement("div");
-  header.style.cssText =
-    "display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;" +
-    "border-bottom:1px solid #0a0;padding-bottom:3px;";
+  header.className = "cast-debug-header";
   header.innerHTML =
     '<span style="font-weight:bold;color:#0f0">🔊 Cast Debug</span>';
   const btnGroup = document.createElement("span");
 
   const copyBtn = document.createElement("button");
   copyBtn.textContent = "Copy";
-  copyBtn.style.cssText = "margin-left:6px;font-size:10px;cursor:pointer;background:#222;color:#0f0;border:1px solid #0a0;padding:1px 6px;";
+  copyBtn.tabIndex = -1;
+  copyBtn.className = "cast-debug-btn";
   copyBtn.addEventListener("click", () => {
     const text = castLogEntries.map((e) => `[${e.ts}] ${e.level} ${e.msg}`).join("\n");
     navigator.clipboard.writeText(text).catch(() => {});
@@ -58,7 +55,8 @@ function _ensureCastDebugPanel() {
 
   const clearBtn = document.createElement("button");
   clearBtn.textContent = "Clear";
-  clearBtn.style.cssText = "margin-left:4px;font-size:10px;cursor:pointer;background:#222;color:#0f0;border:1px solid #0a0;padding:1px 6px;";
+  clearBtn.tabIndex = -1;
+  clearBtn.className = "cast-debug-btn";
   clearBtn.addEventListener("click", () => {
     castLogEntries.length = 0;
     if (castDebugPanelBodyEl) castDebugPanelBodyEl.innerHTML = "";
@@ -66,9 +64,10 @@ function _ensureCastDebugPanel() {
 
   const closeBtn = document.createElement("button");
   closeBtn.textContent = "✕";
-  closeBtn.style.cssText = "margin-left:4px;font-size:10px;cursor:pointer;background:#222;color:#f44;border:1px solid #a00;padding:1px 6px;";
+  closeBtn.tabIndex = -1;
+  closeBtn.className = "cast-debug-btn cast-debug-close-btn";
   closeBtn.addEventListener("click", () => {
-    castDebugPanelEl.style.display = "none";
+    hideCastDebugPanel();
   });
 
   btnGroup.appendChild(copyBtn);
@@ -78,8 +77,45 @@ function _ensureCastDebugPanel() {
   castDebugPanelEl.appendChild(header);
 
   castDebugPanelBodyEl = document.createElement("div");
+  castDebugPanelBodyEl.className = "cast-debug-body";
   castDebugPanelEl.appendChild(castDebugPanelBodyEl);
   document.body.appendChild(castDebugPanelEl);
+}
+
+function showCastDebugPanel() {
+  _ensureCastDebugPanel();
+  castDebugFullscreen = true;
+  castDebugPanelEl.classList.add("fullscreen");
+  castDebugPanelEl.style.display = "";
+  // Back-fill existing log entries into the panel body.
+  if (castDebugPanelBodyEl && castDebugPanelBodyEl.children.length === 0) {
+    for (const entry of castLogEntries) {
+      const line = document.createElement("div");
+      const color = entry.level === "ERROR" ? "#f44" : entry.level === "WARN" ? "#fa0" : entry.level === "OK" ? "#4f4" : "#0f0";
+      line.style.cssText = `color:${color};word-break:break-all;border-bottom:1px solid #111;padding:1px 0;`;
+      line.textContent = `${entry.ts} ${entry.level} ${entry.msg}`;
+      castDebugPanelBodyEl.appendChild(line);
+    }
+  }
+  castDebugPanelEl.scrollTop = castDebugPanelEl.scrollHeight;
+  castLog("INFO", "debug panel opened (fullscreen)");
+}
+
+function hideCastDebugPanel() {
+  if (!castDebugPanelEl) return;
+  castDebugFullscreen = false;
+  castDebugPanelEl.classList.remove("fullscreen");
+  castDebugPanelEl.style.display = "none";
+  castLog("INFO", "debug panel closed");
+}
+
+function toggleCastDebugPanel() {
+  _ensureCastDebugPanel();
+  if (castDebugFullscreen) {
+    hideCastDebugPanel();
+  } else {
+    showCastDebugPanel();
+  }
 }
 
 function castLog(level, ...args) {
@@ -98,7 +134,7 @@ function castLog(level, ...args) {
   castLogEntries.push({ ts, level, msg });
   if (castLogEntries.length > CAST_LOG_MAX) castLogEntries.shift();
 
-  if (castDebugEnabled) {
+  if (castDebugEnabled || castDebugFullscreen) {
     _ensureCastDebugPanel();
     const line = document.createElement("div");
     const color = level === "ERROR" ? "#f44" : level === "WARN" ? "#fa0" : level === "OK" ? "#4f4" : "#0f0";
@@ -135,6 +171,14 @@ let isCastReady = false;
 let runtimeConfig = {};
 const CAST_NAMESPACE = "urn:x-cast:com.echoai.auth";
 let receiverAuthToken = null;
+
+// In receiver mode, strip native audio controls and remove from tab order so
+// the Google TV D-pad can never focus the browser's built-in media player UI.
+if (receiverMode) {
+  audioEl.removeAttribute("controls");
+  audioEl.tabIndex = -1;
+  audioEl.style.pointerEvents = "none";
+}
 
 castLog("INFO", "app.js loaded — receiverMode:", receiverMode, "castDebug:", castDebugEnabled);
 castLog("INFO", "userAgent:", navigator.userAgent.substring(0, 120));
@@ -493,6 +537,38 @@ async function sendAuthToReceiver(session) {
   }
 }
 
+// Map Cast DetailedErrorCode numbers to readable names for debug logging.
+const CAST_ERROR_CODE_NAMES = {
+  100: "MEDIA_UNKNOWN",
+  101: "MEDIA_ABORTED",
+  102: "MEDIA_DECODE",
+  103: "MEDIA_NETWORK",
+  104: "MEDIA_SRC_NOT_SUPPORTED",
+  110: "SOURCE_BUFFER_FAILURE",
+  111: "MEDIAKEYS_UNKNOWN",
+  112: "MEDIAKEYS_NETWORK",
+  113: "MEDIAKEYS_UNSUPPORTED",
+  200: "SEGMENT_UNKNOWN",
+  201: "SEGMENT_NETWORK",
+  301: "HLS_NETWORK_MASTER_PLAYLIST",
+  302: "HLS_NETWORK_PLAYLIST",
+  303: "HLS_NETWORK_NO_KEY_RESPONSE",
+  304: "HLS_NETWORK_KEY_LOAD",
+  311: "HLS_SEGMENT_PARSING",
+  900: "BREAK_CLIP_LOADING_ERROR",
+  901: "BREAK_SEEK_INTERCEPTOR_ERROR",
+  903: "IMAGE_ERROR",
+  904: "LOAD_INTERRUPTED",
+  905: "LOAD_FAILED",
+  906: "MEDIA_ERROR_MESSAGE",
+  907: "GENERIC",
+};
+
+function _castErrorName(code) {
+  if (code == null || code === "") return "UNKNOWN";
+  return CAST_ERROR_CODE_NAMES[code] || `CODE_${code}`;
+}
+
 function initCastReceiver() {
   castLog("INFO", "initCastReceiver called");
   const castReceiverContext = window.cast && window.cast.framework &&
@@ -507,6 +583,13 @@ function initCastReceiver() {
   castLog("OK", "CastReceiverContext found — initializing receiver");
   const context = castReceiverContext.getInstance();
   const playerManager = context.getPlayerManager();
+
+  // Tell the Cast framework to use OUR <audio> element instead of creating
+  // its own.  This eliminates the dual-media-element conflict that caused
+  // LOAD_FAILED (104) and GENERIC (905) errors — the framework tried to
+  // load media in a separate element while our code drove audioEl.
+  playerManager.setMediaElement(audioEl);
+  castLog("INFO", "playerManager.setMediaElement bound to audioEl");
 
   // Listen for auth token from sender via custom namespace.
   context.addCustomMessageListener(CAST_NAMESPACE, (event) => {
@@ -524,34 +607,31 @@ function initCastReceiver() {
     }
   });
 
-  // When media is loaded, extract episode info from customData and load transcript.
+  // When media is loaded, extract episode info from customData and load
+  // transcript data.  The framework handles setting audioEl.src from the
+  // request's contentUrl (which includes the auth token) — loadEpisode()
+  // skips setting audioEl.src in receiver mode to avoid overwriting it.
   playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, (request) => {
-    castLog("INFO", "LOAD interceptor fired");
+    castLog("INFO", "LOAD interceptor fired — contentUrl:", (request.media && request.media.contentUrl) || "(none)");
     const customData = request.media && request.media.customData;
     if (customData && customData.episodeId) {
-      castLog("INFO", "loading episode from LOAD request:", customData.episodeId);
+      castLog("INFO", "loading transcript for episode:", customData.episodeId);
       loadEpisode(customData.episodeId).catch((err) => {
         castLog("ERROR", "loadEpisode from LOAD interceptor failed:", err.message);
       });
     } else {
       castLog("WARN", "LOAD request had no customData.episodeId");
     }
+    // Return the request so the framework loads the authenticated media URL
+    // into audioEl (via setMediaElement).
     return request;
   });
 
-  // Track playback time for transcript sync.
-  playerManager.addEventListener(cast.framework.events.EventType.TIME_UPDATE, () => {
-    const mediaStatus = playerManager.getMediaInformation();
-    if (mediaStatus) {
-      const currentTime = playerManager.getCurrentTimeSec();
-      if (Math.abs(audioEl.currentTime - currentTime) > 0.5) {
-        audioEl.currentTime = currentTime;
-      }
-    }
-  });
-
   playerManager.addEventListener(cast.framework.events.EventType.ERROR, (event) => {
-    castLog("ERROR", "receiver playerManager error:", event.detailedErrorCode || "", event.reason || "");
+    const code = event.detailedErrorCode;
+    const name = _castErrorName(code);
+    const reason = event.reason || "";
+    castLog("ERROR", `receiver playerManager error: ${code} (${name})`, reason);
   });
 
   // Start the receiver with the custom namespace registered.
@@ -559,8 +639,35 @@ function initCastReceiver() {
   const options = new cast.framework.CastReceiverOptions();
   options.customNamespaces = {};
   options.customNamespaces[CAST_NAMESPACE] = cast.framework.system.MessageType.JSON;
+  options.disableIdleTimeout = true;
+  // Tell the framework we have our own UI — don't show the default media
+  // controls overlay on Google TV / touch-enabled Cast devices.
+  options.touchScreenOptimizedApp = true;
+  options.playbackConfig = new cast.framework.PlaybackConfig();
+  options.playbackConfig.autoResumeDuration = 5;
   context.start(options);
   castLog("OK", "CastReceiverContext started");
+
+  // Transport interceptors — the framework drives audioEl directly via
+  // setMediaElement, so we only log here (no manual audioEl.pause() etc.).
+  playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PAUSE, (requestData) => {
+    castLog("INFO", "remote PAUSE command received");
+    return requestData;
+  });
+  playerManager.setMessageInterceptor(cast.framework.messages.MessageType.PLAY, (requestData) => {
+    castLog("INFO", "remote PLAY command received");
+    return requestData;
+  });
+  playerManager.setMessageInterceptor(cast.framework.messages.MessageType.SEEK, (requestData) => {
+    if (requestData && requestData.currentTime !== undefined) {
+      castLog("INFO", "remote SEEK command:", requestData.currentTime);
+    }
+    return requestData;
+  });
+
+  // Ensure our page has focus so keydown events from the remote reach us.
+  document.body.setAttribute("tabindex", "-1");
+  document.body.focus();
 
   // Log receiver system events.
   context.addEventListener(cast.framework.system.EventType.READY, () => {
@@ -573,7 +680,9 @@ function initCastReceiver() {
     castLog("INFO", "sender disconnected:", event.senderId || "", "reason:", event.reason || "");
   });
   context.addEventListener(cast.framework.system.EventType.ERROR, (event) => {
-    castLog("ERROR", "receiver system error:", event.detailedErrorCode || "", event.reason || "");
+    const code = event.detailedErrorCode;
+    const name = _castErrorName(code);
+    castLog("ERROR", `receiver system error: ${code} (${name})`, event.reason || "");
   });
   context.addEventListener(cast.framework.system.EventType.SHUTDOWN, () => {
     castLog("INFO", "receiver shutdown");
@@ -1186,7 +1295,12 @@ async function loadEpisode(id) {
     activeWordIndex = -1;
 
     episodeTitleEl.textContent = data.title;
-    audioEl.src = data.audio;
+
+    // In receiver mode the Cast framework loads the authenticated media URL
+    // (with ?rt= token) into audioEl via setMediaElement — don't overwrite it.
+    if (!receiverMode) {
+      audioEl.src = data.audio;
+    }
 
     if (castSession) {
       loadCurrentEpisodeOnCastSession(castSession);
@@ -1545,7 +1659,46 @@ if (fullscreenBtnEl) fullscreenBtnEl.addEventListener("click", enterFullscreen);
 
 if (receiverPrevBtnEl) receiverPrevBtnEl.addEventListener("click", jumpToPreviousSegment);
 if (receiverNextBtnEl) receiverNextBtnEl.addEventListener("click", jumpToNextSegment);
-if (receiverToggleBtnEl) receiverToggleBtnEl.addEventListener("click", togglePlayPause);
+
+// Long-press the Play/Pause button to toggle the cast debug panel.
+// Short tap still toggles play/pause as before.
+const LONG_PRESS_MS = 1600;
+let _toggleLongPressTimer = null;
+let _toggleDidLongPress = false;
+if (receiverToggleBtnEl) {
+  receiverToggleBtnEl.addEventListener("pointerdown", (e) => {
+    _toggleDidLongPress = false;
+    _toggleLongPressTimer = setTimeout(() => {
+      _toggleDidLongPress = true;
+      _toggleLongPressTimer = null;
+      toggleCastDebugPanel();
+    }, LONG_PRESS_MS);
+  });
+  receiverToggleBtnEl.addEventListener("pointerup", () => {
+    if (_toggleLongPressTimer) {
+      clearTimeout(_toggleLongPressTimer);
+      _toggleLongPressTimer = null;
+    }
+    if (!_toggleDidLongPress) {
+      togglePlayPause();
+    }
+    _toggleDidLongPress = false;
+  });
+  receiverToggleBtnEl.addEventListener("pointercancel", () => {
+    if (_toggleLongPressTimer) {
+      clearTimeout(_toggleLongPressTimer);
+      _toggleLongPressTimer = null;
+    }
+    _toggleDidLongPress = false;
+  });
+  receiverToggleBtnEl.addEventListener("pointerleave", () => {
+    if (_toggleLongPressTimer) {
+      clearTimeout(_toggleLongPressTimer);
+      _toggleLongPressTimer = null;
+    }
+    _toggleDidLongPress = false;
+  });
+}
 
 document.addEventListener("fullscreenchange", () => {
   if (isFullscreen) {
@@ -1657,55 +1810,122 @@ if (fsEpisodePickerCloseBtnEl) {
   });
 }
 
-// Chromecast remote behavior:
-// - Episode picker open: up/down to move, enter/space to select.
-// - Episode picker closed: left/right for segment nav, enter/space play/pause.
+// Chromecast remote / Google TV remote behavior:
+// - Episode picker open: up/down to move, enter/select, back to close.
+// - Episode picker closed: left/right for segment nav, enter/space play/pause,
+//   up/down to open episode picker.
+// - Media keys: MediaPlayPause, MediaTrackNext, MediaTrackPrevious.
+//
+// We use { capture: true } so the handler fires BEFORE any focused element
+// (e.g. native audio controls) or the Cast framework can consume the event.
+// Every handled branch calls stopPropagation + preventDefault to prevent the
+// browser/system from showing the native audio player bar or seeking the audio
+// via built-in controls.
 document.addEventListener("keydown", async (e) => {
   if (!isFullscreen) return;
 
+  // Always re-focus body so next keypress is captured by us, not native UI.
+  if (document.activeElement && document.activeElement !== document.body) {
+    document.body.focus();
+  }
+
+  // Helper: consume the event completely.
+  function consume() {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  // ── Media keys (Google TV remote play/pause/skip buttons) ──────────
+  if (e.key === "MediaPlayPause") {
+    consume();
+    togglePlayPause();
+    return;
+  }
+  if (e.key === "MediaPlay") {
+    consume();
+    if (audioEl.paused) audioEl.play();
+    return;
+  }
+  if (e.key === "MediaPause") {
+    consume();
+    if (!audioEl.paused) audioEl.pause();
+    return;
+  }
+  if (e.key === "MediaTrackNext") {
+    consume();
+    jumpToNextSegment();
+    return;
+  }
+  if (e.key === "MediaTrackPrevious") {
+    consume();
+    jumpToPreviousSegment();
+    return;
+  }
+
+  // ── Episode picker open ────────────────────────────────────────────
   if (isFsEpisodePickerOpen) {
     if (e.code === "ArrowUp") {
-      e.preventDefault();
+      consume();
       moveFsEpisodePicker(-1);
       return;
     }
     if (e.code === "ArrowDown") {
-      e.preventDefault();
+      consume();
       moveFsEpisodePicker(1);
       return;
     }
     if (e.code === "Enter" || e.code === "Space") {
-      e.preventDefault();
+      consume();
       await selectEpisodeFromFsPicker();
       return;
     }
-    if (e.code === "Escape") {
-      e.preventDefault();
+    if (e.code === "Escape" || e.key === "GoBack" || e.code === "Backspace") {
+      consume();
       if (currentEpisodeId) closeFsEpisodePicker();
       return;
     }
+    // Swallow any other key while picker is open to prevent native handling.
+    consume();
     return;
   }
 
+  // ── Playback controls (D-pad) ──────────────────────────────────────
   if (e.code === "ArrowLeft") {
-    e.preventDefault();
+    consume();
     jumpToPreviousSegment();
     return;
   }
   if (e.code === "ArrowRight") {
-    e.preventDefault();
+    consume();
     jumpToNextSegment();
     return;
   }
   if (e.code === "Enter" || e.code === "Space") {
-    e.preventDefault();
+    consume();
     togglePlayPause();
     return;
   }
   if (e.code === "ArrowUp") {
-    e.preventDefault();
+    consume();
     openFsEpisodePicker();
+    return;
   }
-});
+  if (e.code === "ArrowDown") {
+    consume();
+    openFsEpisodePicker();
+    return;
+  }
+  if (e.code === "Escape" || e.key === "GoBack" || e.code === "Backspace") {
+    consume();
+    openFsEpisodePicker();
+    return;
+  }
+
+  // In receiver mode, swallow any remaining keys so they never reach
+  // the native audio element or trigger system-level media controls.
+  if (receiverMode) {
+    consume();
+  }
+}, /* capture */ true);
 
 init();

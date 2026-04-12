@@ -56,19 +56,19 @@
     <div id="fsProgressBarTrack">
       <div id="fsProgressBarFill"></div>
     </div>
-    <button id="fsExitBtn">✕ Exit</button>
+    <button id="fsExitBtn" tabindex="-1">✕ Exit</button>
     <div id="fsTranscript"></div>
     <div id="receiverControls" aria-label="Playback controls">
-      <button id="receiverPrevBtn" type="button" aria-label="Previous segment">Prev</button>
-      <button id="receiverToggleBtn" type="button" aria-label="Play or pause">Play</button>
-      <button id="receiverNextBtn" type="button" aria-label="Next segment">Next</button>
-      <button id="receiverEpisodesBtn" type="button" aria-label="Choose episode">Episodes</button>
+      <button id="receiverPrevBtn" type="button" tabindex="-1" aria-label="Previous segment">Prev</button>
+      <button id="receiverToggleBtn" type="button" tabindex="-1" aria-label="Play or pause">Play</button>
+      <button id="receiverNextBtn" type="button" tabindex="-1" aria-label="Next segment">Next</button>
+      <button id="receiverEpisodesBtn" type="button" tabindex="-1" aria-label="Choose episode">Episodes</button>
     </div>
     <div id="fsEpisodePicker" class="hidden" aria-label="Episode picker" aria-modal="true" role="dialog">
       <div class="picker-panel">
         <div class="picker-header">
           <h3>Choose Episode</h3>
-          <button id="fsEpisodePickerCloseBtn" type="button" aria-label="Close episode picker">Close</button>
+          <button id="fsEpisodePickerCloseBtn" type="button" tabindex="-1" aria-label="Close episode picker">Close</button>
         </div>
         <div id="fsEpisodePickerList" class="picker-list"></div>
       </div>

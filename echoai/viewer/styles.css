@@ -398,6 +398,17 @@ body.receiver-mode .layout {
   display: none;
 }
 
+/* Hide the native audio player in receiver mode — all playback is controlled
+   by our fullscreen overlay buttons and the Cast playerManager. */
+body.receiver-mode #audioPlayer {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 0;
+}
+
 body.receiver-mode #fsOverlay.hidden {
   display: flex;
 }
@@ -541,4 +552,76 @@ body.receiver-mode #fsTranscript {
   background: #dcfce7;
   border-color: #16a34a;
   color: #166534;
+}
+
+/* ── Cast Debug Panel ── */
+.cast-debug-panel {
+  position: fixed;
+  bottom: 0;
+  right: 0;
+  width: 420px;
+  max-height: 45vh;
+  overflow-y: auto;
+  background: rgba(0, 0, 0, 0.88);
+  color: #0f0;
+  font: 11px/1.4 monospace;
+  padding: 6px 8px;
+  z-index: 99999;
+  border-top: 2px solid #0f0;
+  border-left: 2px solid #0f0;
+  pointer-events: auto;
+  user-select: text;
+}
+
+.cast-debug-panel.fullscreen {
+  inset: 0;
+  width: 100%;
+  max-height: none;
+  border: none;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 10px 14px;
+}
+
+.cast-debug-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+  border-bottom: 1px solid #0a0;
+  padding-bottom: 3px;
+  position: sticky;
+  top: 0;
+  background: rgba(0, 0, 0, 0.92);
+  z-index: 1;
+}
+
+.cast-debug-panel.fullscreen .cast-debug-header {
+  padding: 8px 6px;
+  margin-bottom: 8px;
+  font-size: 15px;
+}
+
+.cast-debug-btn {
+  margin-left: 6px;
+  font-size: 10px;
+  cursor: pointer;
+  background: #222;
+  color: #0f0;
+  border: 1px solid #0a0;
+  padding: 1px 6px;
+}
+
+.cast-debug-panel.fullscreen .cast-debug-btn {
+  font-size: 14px;
+  padding: 4px 12px;
+}
+
+.cast-debug-close-btn {
+  color: #f44;
+  border-color: #a00;
+}
+
+.cast-debug-body {
+  overflow-y: auto;
 }
