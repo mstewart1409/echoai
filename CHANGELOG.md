@@ -1,3 +1,9 @@
+## 0.3.0 (2026-04-12)
+
+### Feat
+
+- improve dynamic loading of Cast SDK and enhance version tagging in deployment workflows
+
 ## 0.2.0 (2026-04-12)
 
 ### Feat
