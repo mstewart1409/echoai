@@ -1,3 +1,9 @@
+## 0.6.0 (2026-04-12)
+
+### Feat
+
+- implement bidirectional sync for Chromecast with enhanced media control and episode change notifications
+
 ## 0.5.0 (2026-04-12)
 
 ### Feat
