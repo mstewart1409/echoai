@@ -1,3 +1,9 @@
+## 0.7.0 (2026-04-12)
+
+### Feat
+
+- enhance Chromecast session management with improved audio playback handling and episode loading
+
 ## 0.6.0 (2026-04-12)
 
 ### Feat
