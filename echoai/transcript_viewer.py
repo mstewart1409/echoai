@@ -10,6 +10,8 @@ import re
 import secrets
 import threading
 import time
+from collections import OrderedDict
+
 import requests
 import spacy
 from pathlib import Path
@@ -45,6 +47,10 @@ AUTH_SESSION_SECRET = os.getenv('TRANSCRIPT_VIEWER_AUTH_SESSION_SECRET', CAST_SI
 AUTH_SESSION_COOKIE_NAME = (
     os.getenv('TRANSCRIPT_VIEWER_AUTH_SESSION_COOKIE_NAME', 'tv_session').strip() or 'tv_session'
 )
+COOKIE_SECURE = os.getenv('TRANSCRIPT_VIEWER_COOKIE_SECURE', '1').strip().lower() not in (
+    '0',
+    'false',
+)
 try:
     CAST_TOKEN_TTL_SECONDS = int(os.getenv('TRANSCRIPT_VIEWER_CAST_TOKEN_TTL_SECONDS', '300'))
 except ValueError:
@@ -57,7 +63,26 @@ CAST_TOKEN_REQUIRED_FOR_MEDIA = (
     os.getenv('TRANSCRIPT_VIEWER_CAST_TOKEN_REQUIRED_FOR_MEDIA', '0') == '1'
 )
 
+# Bounded cache sizes — prevent unbounded memory growth.
+CACHE_MAX_SIZE = int(os.getenv('TRANSCRIPT_VIEWER_CACHE_MAX_SIZE', '10000'))
+AUTH_SESSIONS_MAX = int(os.getenv('TRANSCRIPT_VIEWER_AUTH_SESSIONS_MAX', '1000'))
+
+# Maximum input lengths for translation/analysis endpoints.
+TRANSLATE_TEXT_MAX_LEN = 500
+TRANSLATE_WORD_MAX_LEN = 80
+
+# Regex for safe episode IDs — letters, digits, hyphens, underscores only.
+_SAFE_EPISODE_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
 logger = logging.getLogger(__name__)
+
+
+def _validate_episode_id(episode_id: str) -> str | None:
+    """Return sanitised episode_id or None if invalid."""
+    episode_id = episode_id.strip()
+    if not episode_id or not _SAFE_EPISODE_ID_RE.fullmatch(episode_id):
+        return None
+    return episode_id
 
 
 def _fallback_to_local_dir(
@@ -146,16 +171,65 @@ CSP_POLICY = (
 
 
 @app.after_request
-def apply_csp_headers(response):
-    """Attach Content-Security-Policy to HTML responses for Chromecast receiver compatibility."""
+def apply_security_headers(response):
+    """Attach security headers to all responses."""
+    # CSP on HTML only.
     content_type = response.content_type or ''
     if 'text/html' in content_type:
         response.headers['Content-Security-Policy'] = CSP_POLICY
+
+    # Universal security headers.
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    if COOKIE_SECURE:
+        response.headers['Strict-Transport-Security'] = 'max-age=63072000; includeSubDomains'
+
+    # Prevent caching of authenticated API responses.
+    if request.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store'
+
     return response
 
 
-TEXT_TRANSLATION_CACHE: dict[str, str] = {}
-ANALYSIS_CACHE: dict[str, dict] = {}
+# ── Bounded cache helper ──────────────────────────────────────────────────────
+
+
+class BoundedCache:
+    """Thread-safe LRU dict with a configurable max size."""
+
+    def __init__(self, max_size: int = 10000) -> None:
+        self._data: OrderedDict[str, object] = OrderedDict()
+        self._max = max_size
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> object | None:
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+                return self._data[key]
+        return None
+
+    def set(self, key: str, value: object) -> None:
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+            self._data[key] = value
+            while len(self._data) > self._max:
+                self._data.popitem(last=False)
+
+    def __contains__(self, key: str) -> bool:
+        with self._lock:
+            return key in self._data
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+
+TEXT_TRANSLATION_CACHE: BoundedCache = BoundedCache(CACHE_MAX_SIZE)
+ANALYSIS_CACHE: BoundedCache = BoundedCache(CACHE_MAX_SIZE)
 AUTH_SESSIONS: dict[str, int] = {}
 AUTH_SESSIONS_LOCK = threading.Lock()
 
@@ -208,8 +282,24 @@ def _new_auth_session(username: str) -> tuple[str, int]:
     sid = f'{sid_payload}:{sid_sig}'
     expires_at = now + max(300, AUTH_SESSION_TTL_SECONDS)
     with AUTH_SESSIONS_LOCK:
+        # Proactive reaping: evict expired sessions before adding new one.
+        _reap_expired_sessions_locked(now)
+        # Enforce max session count.
+        if len(AUTH_SESSIONS) >= AUTH_SESSIONS_MAX:
+            oldest_sid = min(AUTH_SESSIONS, key=AUTH_SESSIONS.get)
+            AUTH_SESSIONS.pop(oldest_sid, None)
         AUTH_SESSIONS[sid] = expires_at
     return sid, expires_at
+
+
+def _reap_expired_sessions_locked(now: int | None = None) -> int:
+    """Remove expired sessions. Must be called with AUTH_SESSIONS_LOCK held."""
+    if now is None:
+        now = int(time.time())
+    expired = [sid for sid, exp in AUTH_SESSIONS.items() if exp < now]
+    for sid in expired:
+        del AUTH_SESSIONS[sid]
+    return len(expired)
 
 
 def _delete_auth_session(sid: str | None) -> None:
@@ -310,7 +400,7 @@ def require_authentication():
     if request.path == '/' or request.path.startswith('/static/'):
         return None
 
-    if request.path in ('/api/auth/status', '/api/auth/login', '/api/cast/debug'):
+    if request.path in ('/api/auth/status', '/api/auth/login'):
         return None
 
     if _validate_auth_session():
@@ -325,13 +415,15 @@ def require_authentication():
 
 @app.get('/api/auth/status')
 def api_auth_status():
-    return jsonify(
-        {
-            'authenticated': AUTH_DISABLED or _validate_auth_session(),
-            'auth_required': not AUTH_DISABLED and _has_auth_credentials_configured(),
-            'username_hint': AUTH_USERNAME,
-        }
-    )
+    authenticated = AUTH_DISABLED or _validate_auth_session()
+    result = {
+        'authenticated': authenticated,
+        'auth_required': not AUTH_DISABLED and _has_auth_credentials_configured(),
+    }
+    # Only reveal username hint to already-authenticated sessions.
+    if authenticated:
+        result['username_hint'] = AUTH_USERNAME
+    return jsonify(result)
 
 
 @app.post('/api/auth/login')
@@ -353,7 +445,7 @@ def api_auth_login():
         max_age=max(300, AUTH_SESSION_TTL_SECONDS),
         httponly=True,
         samesite='Lax',
-        secure=False,
+        secure=COOKIE_SECURE,
     )
     return response
 
@@ -375,9 +467,9 @@ def load_spacy_model() -> spacy.language.Language:
 
     for name in candidates:
         try:
-            print(f'Loading spaCy German model ({name})...')
+            logger.info('Loading spaCy German model (%s)...', name)
             model = spacy.load(name)
-            print('spaCy model loaded.')
+            logger.info('spaCy model loaded.')
             return model
         except OSError:
             logger.warning('spaCy model not available: %s', name)
@@ -453,8 +545,9 @@ def translate_text_de_to_en(text: str) -> str:
     cleaned = re.sub(r'\s+', ' ', text).strip()
     if not cleaned:
         return ''
-    if cleaned in TEXT_TRANSLATION_CACHE:
-        return TEXT_TRANSLATION_CACHE[cleaned]
+    cached = TEXT_TRANSLATION_CACHE.get(cleaned)
+    if cached is not None:
+        return cached
 
     url = 'https://translate.googleapis.com/translate_a/single'
     params = {
@@ -477,7 +570,7 @@ def translate_text_de_to_en(text: str) -> str:
         translated = ''.join(part[0] for part in data[0] if isinstance(part, list) and part)
 
     translated = translated.strip()
-    TEXT_TRANSLATION_CACHE[cleaned] = translated
+    TEXT_TRANSLATION_CACHE.set(cleaned, translated)
     return translated
 
 
@@ -492,14 +585,11 @@ def analyze_word(word: str, context: str = '') -> dict:
     """
     Run spaCy once and return all derived info for a word in context.
     spacy.explain() is used for POS, dependency, and entity labels — no hardcoding.
-    A minimal flat morph-value map handles morphological feature values since
-    spacy.explain() does not cover UniMorph values.
     """
     cache_key = f'analyze_{word.lower()}_{context[:60]}'
-    if cache_key in ANALYSIS_CACHE:
-        cached = ANALYSIS_CACHE[cache_key]
-        if isinstance(cached, dict) and 'grammar_hint' in cached:
-            return cached  # type: ignore[return-value]
+    cached = ANALYSIS_CACHE.get(cache_key)
+    if cached is not None and isinstance(cached, dict) and 'grammar_hint' in cached:
+        return cached
 
     text = context if context else word
     doc = nlp(text)
@@ -516,7 +606,7 @@ def analyze_word(word: str, context: str = '') -> dict:
         'ent_type': '',
     }
     if not token:
-        ANALYSIS_CACHE[cache_key] = empty
+        ANALYSIS_CACHE.set(cache_key, empty)
         return empty
 
     # Use raw spaCy POS tag directly (e.g. noun, verb, det, pron)
@@ -589,7 +679,7 @@ def analyze_word(word: str, context: str = '') -> dict:
         'dep': dep,
         'ent_type': ent_type,
     }
-    ANALYSIS_CACHE[cache_key] = result
+    ANALYSIS_CACHE.set(cache_key, result)
     return result
 
 
@@ -697,23 +787,30 @@ def api_episodes():
 
 @app.get('/api/config')
 def api_config():
-    return jsonify(
-        {
-            'cast_receiver_app_id': CAST_RECEIVER_APP_ID,
-            'auth_required': _is_cast_basic_auth_enabled(),
-            'username_hint': AUTH_USERNAME,
-        }
-    )
+    result = {
+        'cast_receiver_app_id': CAST_RECEIVER_APP_ID,
+        'auth_required': _is_cast_basic_auth_enabled(),
+    }
+    # Only reveal username hint to authenticated sessions.
+    if AUTH_DISABLED or _validate_auth_session():
+        result['username_hint'] = AUTH_USERNAME
+    return jsonify(result)
 
 
 @app.post('/api/cast/session')
 def api_cast_session():
     payload = request.get_json(silent=True) or {}
-    episode_id = str(payload.get('episode_id', '')).strip()
-    logger.info('cast/session requested — episode_id=%s remote=%s', episode_id, request.remote_addr)
+    raw_id = str(payload.get('episode_id', '')).strip()
+    logger.info('cast/session requested — episode_id=%s remote=%s', raw_id, request.remote_addr)
+
+    # Allow the special _auth token request.
+    if raw_id == '_auth':
+        episode_id = '_auth'
+    else:
+        episode_id = _validate_episode_id(raw_id)
     if not episode_id:
-        logger.warning('cast/session: missing episode_id')
-        return jsonify({'error': 'episode_id is required'}), 400
+        logger.warning('cast/session: invalid episode_id: %s', raw_id)
+        return jsonify({'error': 'invalid episode_id'}), 400
     if not CAST_SIGNING_KEY:
         logger.error('cast/session: signing key not configured')
         return jsonify({'error': 'cast token signing key is not configured'}), 500
@@ -794,25 +891,27 @@ def api_cast_debug():
             },
             'csp_policy': CSP_POLICY,
             'server_time': now,
-            'request_remote_addr': request.remote_addr,
-            'request_host': request.host,
         }
     )
 
 
 @app.get('/api/episode/<episode_id>')
 def api_episode(episode_id: str):
-    audio_path = DOWNLOADS_DIR / f'{episode_id}.mp3'
+    safe_id = _validate_episode_id(episode_id)
+    if not safe_id:
+        return jsonify({'error': 'invalid episode id'}), 400
+
+    audio_path = DOWNLOADS_DIR / f'{safe_id}.mp3'
     if not audio_path.exists():
         return jsonify({'error': 'episode not found'}), 404
 
-    json_path = TRANSCRIPTS_DIR / f'{episode_id}.json'
-    srt_path = TRANSCRIPTS_DIR / f'{episode_id}.srt'
-    txt_path = TRANSCRIPTS_DIR / f'{episode_id}.txt'
+    json_path = TRANSCRIPTS_DIR / f'{safe_id}.json'
+    srt_path = TRANSCRIPTS_DIR / f'{safe_id}.srt'
+    txt_path = TRANSCRIPTS_DIR / f'{safe_id}.txt'
 
     payload = {
-        'id': episode_id,
-        'title': episode_title_from_name(episode_id),
+        'id': safe_id,
+        'title': episode_title_from_name(safe_id),
         'audio': f'/media/{audio_path.name}',
         'transcript_type': 'none',
         'segments': [],
@@ -823,10 +922,8 @@ def api_episode(episode_id: str):
     if json_path.exists():
         raw_segs = json.loads(json_path.read_text(encoding='utf-8', errors='ignore'))
 
-        # Strip heavy / unused fields before sending to browser.
-        # Keep only fields the viewer actually uses or can display.
         clean_segs = []
-        flat_words = []  # Collect all words with segment context
+        flat_words = []
         for seg in raw_segs:
             seg_text = seg.get('text', '').strip()
             clean_seg = {
@@ -834,14 +931,12 @@ def api_episode(episode_id: str):
                 'end': seg['end'],
                 'text': seg_text,
                 'translation_en': '',
-                # Quality indicators — used to colour uncertain segments
                 'avg_logprob': round(seg.get('avg_logprob', 0), 4),
                 'no_speech_prob': round(seg.get('no_speech_prob', 0), 4),
             }
 
             clean_segs.append(clean_seg)
 
-            # Extract word-level timing from this segment
             words_in_seg = seg.get('words', [])
             for word_data in words_in_seg:
                 flat_words.append(
@@ -850,16 +945,19 @@ def api_episode(episode_id: str):
                         'start': word_data.get('start', 0),
                         'end': word_data.get('end', 0),
                         'probability': word_data.get('probability', 1),
-                        'context': seg_text,  # Full segment text as context for translation
+                        'context': seg_text,
                     }
                 )
 
         payload['segments'] = clean_segs
-        payload['words'] = flat_words  # Add flattened word-level data
+        payload['words'] = flat_words
         payload['text'] = '\n'.join(s['text'] for s in clean_segs)
         payload['transcript_type'] = 'json'
-        print(
-            f'DEBUG: Extracted {len(flat_words)} words from {len(raw_segs)} segments for {episode_id}'
+        logger.debug(
+            'Extracted %d words from %d segments for %s',
+            len(flat_words),
+            len(raw_segs),
+            safe_id,
         )
 
     elif srt_path.exists():
@@ -882,6 +980,8 @@ def api_translate_text():
     text = (request.args.get('text') or '').strip()
     if not text:
         return jsonify({'translation': ''})
+    if len(text) > TRANSLATE_TEXT_MAX_LEN:
+        return jsonify({'error': 'text too long', 'max': TRANSLATE_TEXT_MAX_LEN}), 400
 
     return jsonify({'translation': translate_text_de_to_en(text)})
 
@@ -893,6 +993,8 @@ def api_translate():
     cleaned = normalize_word(word)
     if not cleaned:
         return jsonify({'translation': ''})
+    if len(word) > TRANSLATE_WORD_MAX_LEN:
+        return jsonify({'error': 'word too long'}), 400
 
     try:
         info = analyze_word(word, context)
@@ -938,6 +1040,8 @@ def api_explain():
     context = (request.args.get('context') or '').strip()
     if not normalize_word(word):
         return jsonify({'title': '', 'points': [], 'examples': []})
+    if len(word) > TRANSLATE_WORD_MAX_LEN:
+        return jsonify({'error': 'word too long'}), 400
 
     try:
         payload = build_follow_on_explanation(word, context)
@@ -963,17 +1067,34 @@ def static_files(filename: str):
     return send_from_directory(VIEWER_DIR, filename)
 
 
+def _validate_secrets() -> None:
+    """Warn at startup if secrets are weak or reused."""
+    issues = []
+    if AUTH_PASSWORD and len(AUTH_PASSWORD) < 12:
+        issues.append('AUTH_PASSWORD is shorter than 12 characters — use a stronger password')
+    if AUTH_SESSION_SECRET and AUTH_SESSION_SECRET == AUTH_PASSWORD:
+        issues.append('AUTH_SESSION_SECRET equals AUTH_PASSWORD — use an independent secret')
+    if CAST_SIGNING_KEY and CAST_SIGNING_KEY == AUTH_PASSWORD:
+        issues.append('CAST_SIGNING_KEY equals AUTH_PASSWORD — use an independent signing key')
+    if AUTH_SESSION_SECRET and len(AUTH_SESSION_SECRET) < 32:
+        issues.append('AUTH_SESSION_SECRET is shorter than 32 characters')
+    for issue in issues:
+        logger.warning('SECURITY: %s', issue)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Run local transcript web viewer')
     parser.add_argument('--host', default=os.getenv('TRANSCRIPT_VIEWER_HOST', '0.0.0.0'))
     parser.add_argument('--port', type=int, default=env_int('TRANSCRIPT_VIEWER_PORT', 8765))
     args = parser.parse_args()
 
+    _validate_secrets()
+
     VIEWER_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f'Viewer: http://{args.host}:{args.port}')
+    logger.info('Viewer: http://%s:%d', args.host, args.port)
     app.run(host=args.host, port=args.port, debug=False)
 
 

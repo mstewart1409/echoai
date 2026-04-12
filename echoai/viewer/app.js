@@ -583,9 +583,11 @@ function initCastReceiver() {
 async function loadEpisodesForReceiver() {
   castLog("INFO", "loadEpisodesForReceiver called");
   try {
+    await loadRuntimeConfig();
     episodes = await fetchJson("/api/episodes");
     castLog("OK", "episodes loaded for receiver:", episodes.length);
     filteredEpisodes = episodes.slice();
+    statusTextEl.textContent = `${episodes.length} episode(s) found.`;
     renderEpisodeList();
     if (!currentEpisodeId) {
       openFsEpisodePicker();
@@ -1575,6 +1577,21 @@ translationToggleBtnEl.addEventListener("click", () => {
 async function init() {
   castLog("INFO", "init() starting");
   try {
+    if (receiverMode) {
+      // Receiver mode: set up Cast receiver FIRST, then wait for auth token
+      // from the sender before loading any data.  The sender sends a signed
+      // token via the custom Cast namespace; loadEpisodesForReceiver() is
+      // called once the token arrives (see initCastReceiver listener).
+      castLog("INFO", "entering receiver mode — deferring data load until auth token arrives");
+      enterFullscreen();
+      initCastReceiver();
+      if (!currentEpisodeId) {
+        openFsEpisodePicker();
+      }
+      return;
+    }
+
+    // Sender mode: normal auth + data load flow.
     await ensureAuthenticatedSession();
     castLog("INFO", "auth session ensured");
     await loadRuntimeConfig();
@@ -1584,17 +1601,8 @@ async function init() {
     castLog("INFO", "episodes loaded:", episodes.length);
     renderEpisodeList();
 
-    if (receiverMode) {
-      castLog("INFO", "entering receiver mode");
-      enterFullscreen();
-      initCastReceiver();
-      if (!currentEpisodeId) {
-        openFsEpisodePicker();
-      }
-    } else {
-      castLog("INFO", "entering sender mode");
-      initCastSender();
-    }
+    castLog("INFO", "entering sender mode");
+    initCastSender();
   } catch (err) {
     castLog("ERROR", "init failed:", err.message);
     statusTextEl.textContent = `Error: ${err.message}`;

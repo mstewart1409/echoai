@@ -19,10 +19,10 @@ services:
       - 8.8.8.8
       - 1.1.1.1
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     volumes:
-      - ./downloads:/app/downloads
-      - ./transcripts:/app/transcripts
+      - ./downloads:/app/downloads:ro
+      - ./transcripts:/app/transcripts:ro
     read_only: true
     tmpfs:
       - /tmp
@@ -30,6 +30,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    pids_limit: 100
+    mem_limit: 512m
+    memswap_limit: 512m
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
 
