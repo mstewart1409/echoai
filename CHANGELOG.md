@@ -1,3 +1,9 @@
+## 0.8.0 (2026-04-12)
+
+### Feat
+
+- enhance logging and error handling in audio and episode management functions
+
 ## 0.7.0 (2026-04-12)
 
 ### Feat
