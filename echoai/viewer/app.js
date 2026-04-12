@@ -177,9 +177,13 @@ let remotePlayer = null;
 let remotePlayerController = null;
 let castTimeSyncInterval = null;
 
-/** Whether we have an active Cast session with a connected remote player. */
+/**
+ * Whether we have an active Cast session.  Uses `castSession` (set reliably
+ * by SESSION_STATE_CHANGED) rather than `remotePlayer.isConnected` which can
+ * lag behind or require media to be loaded first.
+ */
 function _isCasting() {
-  return !!(remotePlayerController && remotePlayer?.isConnected);
+  return !!(castSession && remotePlayerController);
 }
 
 /**
@@ -188,8 +192,13 @@ function _isCasting() {
  */
 function _seekTo(time, autoPlay = true) {
   audioEl.currentTime = time;
-  if (autoPlay && audioEl.paused) audioEl.play();
+  if (autoPlay && audioEl.paused) {
+    audioEl.play().catch((err) => {
+      castLog("WARN", "_seekTo play failed:", err.message);
+    });
+  }
   if (_isCasting()) {
+    castLog("INFO", "_seekTo → Chromecast:", time.toFixed(1), "s, autoPlay:", autoPlay);
     remotePlayer.currentTime = time;
     remotePlayerController.seek();
     // When the user clicks a segment to play from that position, also resume
@@ -214,6 +223,23 @@ function _unmuteSenderForCast() {
   if (receiverMode) return;
   audioEl.muted = false;
   castLog("INFO", "sender audio unmuted — casting ended");
+}
+
+/**
+ * Ensure the sender's local audio is playing muted so that its native
+ * `timeupdate` event drives transcript tracking and the HTML5 player UI
+ * shows the correct time position.  Safe to call repeatedly — no-ops if
+ * already playing.  Handles promise rejection gracefully.
+ */
+function _ensureLocalMutedPlayback() {
+  if (receiverMode) return;
+  if (!audioEl.src) return;
+  audioEl.muted = true;
+  if (audioEl.paused) {
+    audioEl.play().catch((err) => {
+      castLog("WARN", "_ensureLocalMutedPlayback failed:", err.message);
+    });
+  }
 }
 
 // In receiver mode, strip native audio controls and remove from tab order so
@@ -385,11 +411,11 @@ function getCurrentEpisodeMeta() {
   };
 }
 
-async function loadCurrentEpisodeOnCastSession(session) {
+async function loadCurrentEpisodeOnCastSession(session, startTime = 0) {
   const meta = getCurrentEpisodeMeta();
   if (!meta) { castLog("WARN", "loadCurrentEpisodeOnCastSession: no episode meta"); return; }
 
-  castLog("INFO", "loading media on Cast session:", meta.id, meta.mediaUrl);
+  castLog("INFO", "loading media on Cast session:", meta.id, meta.mediaUrl, "startTime:", startTime);
 
   let mediaUrl = meta.mediaUrl;
   try {
@@ -411,11 +437,11 @@ async function loadCurrentEpisodeOnCastSession(session) {
   mediaInfo.metadata = md;
   mediaInfo.customData = {
     episodeId: meta.id,
-    startTime: audioEl.currentTime || 0,
+    startTime,
   };
 
   const request = new chrome.cast.media.LoadRequest(mediaInfo);
-  request.currentTime = audioEl.currentTime || 0;
+  request.currentTime = startTime;
   request.autoplay = true;
 
   castLog("INFO", "sending LoadRequest — currentTime:", request.currentTime);
@@ -441,6 +467,11 @@ function setupCastSync(session) {
   remotePlayerController = new cast.framework.RemotePlayerController(remotePlayer);
   castLog("INFO", "RemotePlayer + Controller created");
 
+  // Kick-start local muted playback so the sender UI tracks position from
+  // the moment casting begins — don't wait for IS_PAUSED_CHANGED which may
+  // not fire until the Chromecast finishes loading media.
+  _ensureLocalMutedPlayback();
+
   // Mirror remote play/pause to local audioEl — the local element plays muted
   // so its timeupdate event drives transcript tracking naturally.
   remotePlayerController.addEventListener(
@@ -449,8 +480,8 @@ function setupCastSync(session) {
       castLog("INFO", "remote IS_PAUSED_CHANGED — paused:", remotePlayer.isPaused);
       if (remotePlayer.isPaused) {
         audioEl.pause();
-      } else if (audioEl.paused) {
-        audioEl.play();
+      } else {
+        _ensureLocalMutedPlayback();
       }
     }
   );
@@ -467,8 +498,15 @@ function setupCastSync(session) {
 
   // Lightweight drift correction — the local muted audioEl may drift slightly
   // from the receiver over time.  Every 2s, snap it back if the gap exceeds 1s.
+  // Also recovers from the edge case where local playback was rejected the
+  // first time (e.g. browser autoplay policy) — retries play() each cycle.
   castTimeSyncInterval = setInterval(() => {
-    if (!remotePlayer?.isConnected) return;
+    if (!_isCasting()) return;
+    // If remote is playing but local is paused, restart local muted playback.
+    if (!remotePlayer.isPaused && audioEl.paused) {
+      castLog("INFO", "drift interval: remote playing but local paused — restarting");
+      _ensureLocalMutedPlayback();
+    }
     const drift = Math.abs(audioEl.currentTime - remotePlayer.currentTime);
     if (drift > 1) {
       castLog("INFO", "drift correction:", drift.toFixed(1), "s");
@@ -482,6 +520,13 @@ function setupCastSync(session) {
       const msg = typeof messageStr === "string" ? JSON.parse(messageStr) : messageStr;
       castLog("INFO", "sender received Cast message — type:", msg.type);
       if (msg.type === "episodeChanged" && msg.episodeId) {
+        // If the sender already initiated this episode change, the receiver
+        // is just echoing it back.  Ignore to avoid cancelling the sender's
+        // in-progress loadEpisode (which would kill transcript rendering).
+        if (msg.episodeId === currentEpisodeId) {
+          castLog("INFO", "sender already on episode:", msg.episodeId, "— ignoring echo");
+          return;
+        }
         castLog("INFO", "receiver changed episode to:", msg.episodeId);
         loadEpisode(msg.episodeId, { skipCastLoad: true });
       }
@@ -557,7 +602,7 @@ function initCastSender() {
         _muteSenderForCast();
         setupCastSync(castSession);
         void sendAuthToReceiver(castSession);
-        void loadCurrentEpisodeOnCastSession(castSession);
+        void loadCurrentEpisodeOnCastSession(castSession, audioEl.currentTime || 0);
       }
       if (event.sessionState === cast.framework.SessionState.SESSION_RESUMED && castSession) {
         castLog("OK", "Cast session resumed — restoring sync");
@@ -1475,8 +1520,9 @@ async function loadEpisode(id, { skipCastLoad = false, skipAudioSrc = false } = 
 
     // Send LOAD to Chromecast — unless this call originated from the receiver
     // (which already has the episode loaded) to prevent an echo loop.
+    // Start from 0 — this is a new episode, not a resume.
     if (castSession && !skipCastLoad) {
-      loadCurrentEpisodeOnCastSession(castSession);
+      loadCurrentEpisodeOnCastSession(castSession, 0);
     }
 
     if (data.transcript_type === "json" || data.transcript_type === "srt") {
@@ -2030,6 +2076,12 @@ document.addEventListener("keydown", async (e) => {
     e.stopPropagation();
   }
 
+  // Chromecast / Google TV remotes set e.key but may leave e.code empty
+  // for the center D-pad button.  Check both for keyboard + remote compat.
+  const isConfirmKey = e.key === "Enter" || e.key === " " || e.code === "Enter" || e.code === "Space";
+  const isBackKey = e.key === "Escape" || e.key === "GoBack" || e.key === "Backspace"
+    || e.code === "Escape" || e.code === "Backspace";
+
   // ── Media keys (Google TV remote play/pause/skip buttons) ──────────
   if (e.key === "MediaPlayPause") {
     consume();
@@ -2073,9 +2125,9 @@ document.addEventListener("keydown", async (e) => {
     }
     // Enter/Space in picker: handled via the keydown/keyup long-press logic
     // below (short press → select episode, long press → debug panel).
-    if (e.code === "Enter" || e.code === "Space") {
+    if (isConfirmKey) {
       // Fall through to the long-press Enter handler below.
-    } else if (e.code === "Escape" || e.key === "GoBack" || e.code === "Backspace") {
+    } else if (isBackKey) {
       consume();
       if (currentEpisodeId) closeFsEpisodePicker();
       return;
@@ -2099,7 +2151,7 @@ document.addEventListener("keydown", async (e) => {
   }
   // Enter/Space: short press → play/pause, long press → debug panel.
   // We start a timer on keydown; keyup decides whether it was short or long.
-  if (e.code === "Enter" || e.code === "Space") {
+  if (isConfirmKey) {
     consume();
     if (!_enterLongPressTimer && !_enterDidLongPress) {
       _enterDidLongPress = false;
@@ -2121,7 +2173,7 @@ document.addEventListener("keydown", async (e) => {
     openFsEpisodePicker();
     return;
   }
-  if (e.code === "Escape" || e.key === "GoBack" || e.code === "Backspace") {
+  if (isBackKey) {
     consume();
     openFsEpisodePicker();
     return;
@@ -2137,7 +2189,8 @@ document.addEventListener("keydown", async (e) => {
 
 document.addEventListener("keyup", (e) => {
   if (!isFullscreen) return;
-  if (e.code === "Enter" || e.code === "Space") {
+  const isConfirmKey = e.key === "Enter" || e.key === " " || e.code === "Enter" || e.code === "Space";
+  if (isConfirmKey) {
     e.preventDefault();
     e.stopPropagation();
     if (_enterLongPressTimer) {
