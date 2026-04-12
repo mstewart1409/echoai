@@ -425,8 +425,19 @@ body.receiver-mode #fullscreenBtn {
   display: none;
 }
 
+/* In receiver mode the Chromecast D-pad handles all navigation — hide the
+   on-screen playback buttons (prev/play/next/episodes) and the episode
+   picker's close button.  They remain visible in sender fullscreen mode. */
+body.receiver-mode #receiverControls {
+  display: none;
+}
+
+body.receiver-mode #fsEpisodePickerCloseBtn {
+  display: none;
+}
+
 body.receiver-mode #fsTranscript {
-  padding-bottom: 140px;
+  padding-bottom: 40px;
 }
 
 #receiverControls {

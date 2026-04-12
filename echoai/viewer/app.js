@@ -284,9 +284,10 @@ async function fetchJson(url) {
   if (receiverAuthToken) {
     headers["X-Cast-Token"] = receiverAuthToken;
   }
+  castLog("INFO", "fetchJson →", url, receiverAuthToken ? "(cast-token)" : "(no token)");
   const res = await fetch(url, { headers });
   if (!res.ok) {
-    castLog("ERROR", "fetchJson failed:", url, "status:", res.status);
+    castLog("ERROR", "fetchJson failed:", url, "status:", res.status, res.statusText);
     throw new Error(`Request failed: ${res.status}`);
   }
   return res.json();
@@ -308,28 +309,36 @@ async function ensureAuthenticatedSession() {
     const tokenFromQuery = new URLSearchParams(window.location.search).get("rt");
     if (tokenFromQuery) {
       receiverAuthToken = tokenFromQuery;
+      castLog("INFO", "receiver auth: token from query string");
       return;
     }
     // No token yet — receiver will wait for Cast message in initCastReceiver.
+    castLog("INFO", "receiver auth: no query token, waiting for Cast namespace message");
     return;
   }
 
+  castLog("INFO", "ensureAuthenticatedSession: checking /api/auth/status");
   const statusRes = await fetch("/api/auth/status");
   if (!statusRes.ok) {
+    castLog("ERROR", "auth status check failed:", statusRes.status);
     throw new Error(`Auth status failed: ${statusRes.status}`);
   }
 
   const status = await statusRes.json();
   if (status.authenticated) {
+    castLog("INFO", "already authenticated");
     return;
   }
 
+  castLog("INFO", "not authenticated — prompting for credentials");
   const username = globalThis.prompt("Username", status.username_hint || "") || "";
   const password = globalThis.prompt("Password", "") || "";
   if (!username || !password) {
+    castLog("WARN", "login cancelled by user");
     throw new Error("Login canceled.");
   }
 
+  castLog("INFO", "attempting login for user:", username);
   const loginRes = await fetch("/api/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -337,11 +346,14 @@ async function ensureAuthenticatedSession() {
   });
 
   if (!loginRes.ok) {
+    castLog("ERROR", "login failed:", loginRes.status);
     throw new Error(`Login failed: ${loginRes.status}`);
   }
+  castLog("OK", "login succeeded");
 }
 
 async function requestCastSessionToken(episodeId) {
+  castLog("INFO", "requestCastSessionToken for:", episodeId);
   const response = await fetch("/api/cast/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -349,9 +361,11 @@ async function requestCastSessionToken(episodeId) {
   });
 
   if (!response.ok) {
+    castLog("ERROR", "cast session token request failed:", response.status);
     throw new Error(`Cast token request failed: ${response.status}`);
   }
   const data = await response.json();
+  castLog("OK", "cast session token received — expires_at:", data.expires_at || "unknown");
   return data.token || null;
 }
 
@@ -954,6 +968,7 @@ tooltipExplainBtnEl.addEventListener("click", async () => {
     tooltipExplainBtnEl.textContent = "Explaining...";
     const params = new URLSearchParams({ word: tooltipWord });
     if (tooltipContext) params.set("context", tooltipContext);
+    castLog("INFO", "explain request:", tooltipWord);
     const data = await fetchJson(`/api/explain?${params}`);
 
     const lines = [];
@@ -966,7 +981,8 @@ tooltipExplainBtnEl.addEventListener("click", async () => {
       for (const ex of data.examples) lines.push(`* ${ex}`);
     }
     tooltipTextEl.textContent = lines.join("\n");
-  } catch {
+  } catch (err) {
+    castLog("WARN", "explain failed:", tooltipWord, "—", err.message || "unknown");
     tooltipTextEl.textContent = "Could not load explanation.";
   } finally {
     tooltipExplainBtnEl.disabled = false;
@@ -982,10 +998,15 @@ async function translateWord(word, context) {
 
   const params = new URLSearchParams({ word });
   if (context) params.set("context", context);
-  const data = await fetchJson(`/api/translate?${params}`);
-  const result = { display: data.display || "", translation: (data.translation || "").trim() };
-  translationCache.set(cacheKey, result);
-  return result;
+  try {
+    const data = await fetchJson(`/api/translate?${params}`);
+    const result = { display: data.display || "", translation: (data.translation || "").trim() };
+    translationCache.set(cacheKey, result);
+    return result;
+  } catch (err) {
+    castLog("WARN", "translateWord failed:", clean, "—", err.message);
+    throw err;
+  }
 }
 
 async function translateSegmentText(text) {
@@ -993,11 +1014,16 @@ async function translateSegmentText(text) {
   if (!clean) return "";
   if (segmentTranslationCache.has(clean)) return segmentTranslationCache.get(clean);
 
-  const params = new URLSearchParams({ text: clean });
-  const data = await fetchJson(`/api/translate-text?${params}`);
-  const translation = (data.translation || "").trim();
-  segmentTranslationCache.set(clean, translation);
-  return translation;
+  try {
+    const params = new URLSearchParams({ text: clean });
+    const data = await fetchJson(`/api/translate-text?${params}`);
+    const translation = (data.translation || "").trim();
+    segmentTranslationCache.set(clean, translation);
+    return translation;
+  } catch (err) {
+    castLog("WARN", "translateSegmentText failed:", clean.substring(0, 60), "—", err.message);
+    throw err;
+  }
 }
 
 function attachWordHover(node, word, context) {
@@ -1022,7 +1048,8 @@ function attachWordHover(node, word, context) {
           ? `${result.display}\n${result.translation}`
           : result.translation;
         showTooltip(display, e.clientX, e.clientY, true);
-      } catch {
+      } catch (err) {
+        castLog("WARN", "word hover translate failed:", word, "—", err.message || "unknown");
         hideTooltip();
       }
     }, 160);
@@ -1163,7 +1190,8 @@ async function loadSegmentTranslation(index, loadToken) {
 
     currentSegments[index].translation_en = translation;
     updateRenderedSegmentCaption(index, translation);
-  } catch {
+  } catch (err) {
+    castLog("WARN", "loadSegmentTranslation failed for segment:", index, "—", err.message || "unknown");
     // Keep transcript usable even if translation loading fails.
   }
 }
@@ -1227,6 +1255,7 @@ function renderEpisodeList() {
     item.appendChild(title);
     item.appendChild(meta);
     item.addEventListener("click", async () => {
+      castLog("INFO", "episode item clicked:", ep.id);
       await loadEpisode(ep.id);
       if (receiverMode) notifySenderEpisodeChanged(ep.id);
     });
@@ -1255,6 +1284,7 @@ function renderFsEpisodePicker() {
     btn.innerHTML = `${ep.title}<span class="picker-meta">${ep.id} · transcript: ${ep.transcript_type}</span>`;
     btn.addEventListener("click", async () => {
       fsEpisodePickerIndex = i;
+      castLog("INFO", "episode picker button clicked:", ep.id);
       await selectEpisodeFromFsPicker();
     });
     fsEpisodePickerListEl.appendChild(btn);
@@ -1273,6 +1303,7 @@ function openFsEpisodePicker() {
   if (!fsEpisodePickerEl) return;
   if (!episodes.length) return;
 
+  castLog("INFO", "openFsEpisodePicker — episodes:", episodes.length, "current:", currentEpisodeId || "none");
   const selectedIdx = episodes.findIndex((ep) => ep.id === currentEpisodeId);
   fsEpisodePickerIndex = selectedIdx >= 0 ? selectedIdx : 0;
   isFsEpisodePickerOpen = true;
@@ -1282,6 +1313,7 @@ function openFsEpisodePicker() {
 
 function closeFsEpisodePicker() {
   if (!fsEpisodePickerEl) return;
+  castLog("INFO", "closeFsEpisodePicker");
   isFsEpisodePickerOpen = false;
   fsEpisodePickerEl.classList.add("hidden");
 }
@@ -1297,6 +1329,7 @@ async function selectEpisodeFromFsPicker() {
   if (fsEpisodePickerIndex < 0 || fsEpisodePickerIndex >= episodes.length) return;
   const ep = episodes[fsEpisodePickerIndex];
   if (!ep) return;
+  castLog("INFO", "selectEpisodeFromFsPicker:", ep.id, "index:", fsEpisodePickerIndex);
   closeFsEpisodePicker();
   await loadEpisode(ep.id);
   if (receiverMode) notifySenderEpisodeChanged(ep.id);
@@ -1488,6 +1521,8 @@ function updateActiveWord() {
 
 async function loadEpisode(id, { skipCastLoad = false, skipAudioSrc = false } = {}) {
   const loadToken = ++activeEpisodeLoadToken;
+  castLog("INFO", "loadEpisode:", id, "token:", loadToken,
+    "skipCastLoad:", skipCastLoad, "skipAudioSrc:", skipAudioSrc);
   currentEpisodeId = id;
   closeFsEpisodePicker();
   updateEpisodeListSelection();
@@ -1496,7 +1531,10 @@ async function loadEpisode(id, { skipCastLoad = false, skipAudioSrc = false } = 
 
   try {
     const data = await fetchJson(`/api/episode/${encodeURIComponent(id)}`);
-    if (loadToken !== activeEpisodeLoadToken) return;
+    if (loadToken !== activeEpisodeLoadToken) {
+      castLog("INFO", "loadEpisode cancelled — token mismatch:", loadToken, "vs", activeEpisodeLoadToken);
+      return;
+    }
 
     currentEpisodeId = data.id;
     currentSegments = [];
@@ -1513,15 +1551,20 @@ async function loadEpisode(id, { skipCastLoad = false, skipAudioSrc = false } = 
       if (receiverMode && receiverAuthToken) {
         const sep = data.audio.includes("?") ? "&" : "?";
         audioEl.src = `${data.audio}${sep}rt=${encodeURIComponent(receiverAuthToken)}`;
+        castLog("INFO", "audioEl.src set (receiver, with token)");
       } else {
         audioEl.src = data.audio;
+        castLog("INFO", "audioEl.src set:", data.audio);
       }
+    } else {
+      castLog("INFO", "audioEl.src skipped (skipAudioSrc)");
     }
 
     // Send LOAD to Chromecast — unless this call originated from the receiver
     // (which already has the episode loaded) to prevent an echo loop.
     // Start from 0 — this is a new episode, not a resume.
     if (castSession && !skipCastLoad) {
+      castLog("INFO", "sending LOAD to Chromecast for new episode");
       loadCurrentEpisodeOnCastSession(castSession, 0);
     }
 
@@ -1549,15 +1592,19 @@ async function loadEpisode(id, { skipCastLoad = false, skipAudioSrc = false } = 
         updateFsCaptionVisibility();
       }
       void hydrateSegmentTranslations(loadToken);
+      castLog("OK", "loadEpisode complete:", id, "type:", data.transcript_type,
+        "segments:", currentSegments.length, "words:", currentWords.length);
     } else if (data.transcript_type === "txt") {
       syncHintEl.textContent = "Plain text transcript (no timestamps available).";
       renderPlainText(data.text || "");
+      castLog("OK", "loadEpisode complete:", id, "type: txt (no timestamps)");
       if (isFullscreen) {
         fsTranscriptEl.innerHTML = '<div class="fs-empty">No timestamped transcript available.</div>';
       }
     } else {
       syncHintEl.textContent = "No transcript yet. Generate with transcribe_podcasts.py.";
       renderPlainText("");
+      castLog("OK", "loadEpisode complete:", id, "type: none");
       if (isFullscreen) {
         fsTranscriptEl.innerHTML = '<div class="fs-empty">No transcript available.</div>';
       }
@@ -1566,7 +1613,11 @@ async function loadEpisode(id, { skipCastLoad = false, skipAudioSrc = false } = 
     updateEpisodeListSelection();
     renderFsEpisodePicker();
   } catch (err) {
-    if (loadToken !== activeEpisodeLoadToken) return;
+    if (loadToken !== activeEpisodeLoadToken) {
+      castLog("INFO", "loadEpisode error suppressed — token mismatch:", loadToken);
+      return;
+    }
+    castLog("ERROR", "loadEpisode failed:", id, "—", err.message);
     statusTextEl.textContent = `Error loading episode: ${err.message}`;
   }
 }
@@ -1723,6 +1774,7 @@ function jumpToNextSegment() {
   const t = audioEl.currentTime + 0.05;
   let nextIdx = currentSegments.findIndex((seg) => seg.start > t);
   if (nextIdx < 0) nextIdx = currentSegments.length - 1;
+  castLog("INFO", "jumpToNextSegment → index:", nextIdx, "from:", t.toFixed(1));
   seekToSegment(nextIdx);
 }
 
@@ -1737,12 +1789,20 @@ function jumpToPreviousSegment() {
       break;
     }
   }
+  castLog("INFO", "jumpToPreviousSegment → index:", prevIdx, "from:", t.toFixed(1));
   seekToSegment(prevIdx);
 }
 
 function togglePlayPause() {
+  castLog("INFO", "togglePlayPause — paused:", audioEl.paused,
+    "src:", audioEl.src ? "set" : "empty", "readyState:", audioEl.readyState);
   if (audioEl.paused) {
-    audioEl.play();
+    const p = audioEl.play();
+    if (p && p.catch) {
+      p.catch((err) => {
+        castLog("ERROR", "togglePlayPause play() rejected:", err.message);
+      });
+    }
   } else {
     audioEl.pause();
   }
@@ -1753,6 +1813,7 @@ function togglePlayPause() {
 }
 
 function enterFullscreen() {
+  castLog("INFO", "enterFullscreen — receiverMode:", receiverMode, "segments:", currentSegments.length);
   isFullscreen = true;
   fsActiveSegmentIndex = -1;
   fsActiveWordIndex = -1;
@@ -1794,6 +1855,7 @@ function enterFullscreen() {
 
 function exitFullscreen() {
   if (receiverMode) return;
+  castLog("INFO", "exitFullscreen");
   isFullscreen = false;
   fsActiveSegmentIndex = -1;
   fsActiveWordIndex = -1;
@@ -2006,6 +2068,8 @@ audioEl.addEventListener("timeupdate", () => {
   updateFsActiveWord();
 });
 audioEl.addEventListener("seeked", () => {
+  castLog("INFO", "audioEl seeked — time:", audioEl.currentTime.toFixed(2),
+    "paused:", audioEl.paused, "casting:", _isCasting());
   if (isFullscreen) {
     fsTranscriptEl.querySelectorAll(".fs-segment.active").forEach(el => el.classList.remove("active"));
     fsTranscriptEl.querySelectorAll("[data-fs-word-index].active, .fs-word.active").forEach(el => el.classList.remove("active"));
@@ -2022,10 +2086,35 @@ audioEl.addEventListener("seeked", () => {
   updateFsActiveSegment();
   updateFsActiveWord();
 });
-audioEl.addEventListener("play", updateFsCaptionVisibility);
+audioEl.addEventListener("play", () => {
+  castLog("INFO", "audioEl play — time:", audioEl.currentTime.toFixed(2),
+    "muted:", audioEl.muted, "casting:", _isCasting());
+  updateFsCaptionVisibility();
+});
 audioEl.addEventListener("pause", () => {
+  castLog("INFO", "audioEl pause — time:", audioEl.currentTime.toFixed(2),
+    "muted:", audioEl.muted, "casting:", _isCasting());
   updateFsCaptionVisibility();
   ensureActiveSegmentTranslation();
+});
+audioEl.addEventListener("error", () => {
+  const e = audioEl.error;
+  castLog("ERROR", "audioEl error — code:", e ? e.code : "?", "message:", e ? e.message : "?",
+    "src:", audioEl.src ? audioEl.src.substring(0, 80) : "empty");
+});
+audioEl.addEventListener("loadstart", () => {
+  castLog("INFO", "audioEl loadstart — src:", audioEl.src ? audioEl.src.substring(0, 80) : "empty");
+});
+audioEl.addEventListener("canplay", () => {
+  castLog("INFO", "audioEl canplay — duration:", audioEl.duration ? audioEl.duration.toFixed(1) : "?",
+    "time:", audioEl.currentTime.toFixed(2));
+});
+audioEl.addEventListener("waiting", () => {
+  castLog("WARN", "audioEl waiting (buffering) — time:", audioEl.currentTime.toFixed(2));
+});
+audioEl.addEventListener("stalled", () => {
+  castLog("WARN", "audioEl stalled — time:", audioEl.currentTime.toFixed(2),
+    "networkState:", audioEl.networkState);
 });
 
 searchInputEl.addEventListener("input", applyFilter);
@@ -2085,28 +2174,33 @@ document.addEventListener("keydown", async (e) => {
   // ── Media keys (Google TV remote play/pause/skip buttons) ──────────
   if (e.key === "MediaPlayPause") {
     consume();
+    castLog("INFO", "key: MediaPlayPause");
     togglePlayPause();
     return;
   }
   if (e.key === "MediaPlay") {
     consume();
+    castLog("INFO", "key: MediaPlay");
     if (audioEl.paused) audioEl.play();
     if (_isCasting() && remotePlayer.isPaused) remotePlayerController.playOrPause();
     return;
   }
   if (e.key === "MediaPause") {
     consume();
+    castLog("INFO", "key: MediaPause");
     if (!audioEl.paused) audioEl.pause();
     if (_isCasting() && !remotePlayer.isPaused) remotePlayerController.playOrPause();
     return;
   }
   if (e.key === "MediaTrackNext") {
     consume();
+    castLog("INFO", "key: MediaTrackNext");
     jumpToNextSegment();
     return;
   }
   if (e.key === "MediaTrackPrevious") {
     consume();
+    castLog("INFO", "key: MediaTrackPrevious");
     jumpToPreviousSegment();
     return;
   }
@@ -2115,11 +2209,13 @@ document.addEventListener("keydown", async (e) => {
   if (isFsEpisodePickerOpen) {
     if (e.code === "ArrowUp") {
       consume();
+      castLog("INFO", "picker: ArrowUp");
       moveFsEpisodePicker(-1);
       return;
     }
     if (e.code === "ArrowDown") {
       consume();
+      castLog("INFO", "picker: ArrowDown");
       moveFsEpisodePicker(1);
       return;
     }
@@ -2129,6 +2225,7 @@ document.addEventListener("keydown", async (e) => {
       // Fall through to the long-press Enter handler below.
     } else if (isBackKey) {
       consume();
+      castLog("INFO", "picker: back key — closing");
       if (currentEpisodeId) closeFsEpisodePicker();
       return;
     } else {
@@ -2141,11 +2238,13 @@ document.addEventListener("keydown", async (e) => {
   // ── Playback controls (D-pad) ──────────────────────────────────────
   if (e.code === "ArrowLeft") {
     consume();
+    castLog("INFO", "key: ArrowLeft → prevSegment");
     jumpToPreviousSegment();
     return;
   }
   if (e.code === "ArrowRight") {
     consume();
+    castLog("INFO", "key: ArrowRight → nextSegment");
     jumpToNextSegment();
     return;
   }
@@ -2154,10 +2253,12 @@ document.addEventListener("keydown", async (e) => {
   if (isConfirmKey) {
     consume();
     if (!_enterLongPressTimer && !_enterDidLongPress) {
+      castLog("INFO", "keydown confirm — starting long-press timer");
       _enterDidLongPress = false;
       _enterLongPressTimer = setTimeout(() => {
         _enterDidLongPress = true;
         _enterLongPressTimer = null;
+        castLog("INFO", "long-press threshold reached — toggling debug panel");
         toggleCastDebugPanel();
       }, LONG_PRESS_MS);
     }
@@ -2165,16 +2266,19 @@ document.addEventListener("keydown", async (e) => {
   }
   if (e.code === "ArrowUp") {
     consume();
+    castLog("INFO", "key: ArrowUp → openPicker");
     openFsEpisodePicker();
     return;
   }
   if (e.code === "ArrowDown") {
     consume();
+    castLog("INFO", "key: ArrowDown → openPicker");
     openFsEpisodePicker();
     return;
   }
   if (isBackKey) {
     consume();
+    castLog("INFO", "key: back → openPicker");
     openFsEpisodePicker();
     return;
   }
@@ -2193,6 +2297,8 @@ document.addEventListener("keyup", (e) => {
   if (isConfirmKey) {
     e.preventDefault();
     e.stopPropagation();
+    castLog("INFO", "keyup confirm — timer:", !!_enterLongPressTimer,
+      "picker:", isFsEpisodePickerOpen, "episode:", currentEpisodeId || "none");
     if (_enterLongPressTimer) {
       // Released before the long-press threshold — treat as short press.
       clearTimeout(_enterLongPressTimer);
