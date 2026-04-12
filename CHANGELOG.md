@@ -1,3 +1,9 @@
+## 0.5.0 (2026-04-12)
+
+### Feat
+
+- enhance Chromecast receiver with debug panel and improved media control handling
+
 ## 0.4.0 (2026-04-12)
 
 ### Feat
