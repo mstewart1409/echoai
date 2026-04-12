@@ -1,3 +1,9 @@
+## 0.4.0 (2026-04-12)
+
+### Feat
+
+- enhance episode loading and security features with bounded caching and improved validation
+
 ## 0.3.0 (2026-04-12)
 
 ### Feat
