@@ -23,7 +23,7 @@ const fsEpisodePickerListEl = document.getElementById("fsEpisodePickerList");
 const fsEpisodePickerCloseBtnEl = document.getElementById("fsEpisodePickerCloseBtn");
 const urlParams = new URLSearchParams(window.location.search);
 const receiverMode = urlParams.get("mode") === "receiver" || urlParams.get("receiver") === "1";
-const castDebugEnabled = urlParams.get("castDebug") === "1";
+const castDebugEnabled = urlParams.get("castDebug") === "1;
 
 // ── Cast Debug Logger ────────────────────────────────────────────────────────
 const CAST_LOG_MAX = 200;
@@ -171,6 +171,7 @@ let isCastReady = false;
 let runtimeConfig = {};
 const CAST_NAMESPACE = "urn:x-cast:com.echoai.auth";
 let receiverAuthToken = null;
+let receiverPlayerManager = null;
 
 // ── Bidirectional Cast sync state ────────────────────────────────────────────
 let remotePlayer = null;
@@ -204,7 +205,7 @@ function _seekTo(time, autoPlay = true) {
     remotePlayerController.seek();
     // When the user clicks a segment to play from that position, also resume
     // the remote if it was paused — otherwise the local muted audio advances
-    // while the remote stays still, and the 2s drift correction keeps snapping
+    // while the remote stays still, and the 500ms drift correction keeps snapping
     // the local position back, creating a janky loop.
     if (autoPlay && remotePlayer.isPaused) {
       remotePlayerController.playOrPause();
@@ -494,43 +495,62 @@ function setupCastSync(session) {
     () => {
       castLog("INFO", "remote IS_PAUSED_CHANGED — paused:", remotePlayer.isPaused);
       if (remotePlayer.isPaused) {
+        // Just pause — don't snap audioEl.currentTime.  The local audio
+        // will be at most ~0.5s ahead (the Cast event latency).  Snapping
+        // back causes a visible transcript jump.  The drift correction
+        // will re-align when playback resumes.
         audioEl.pause();
       } else {
-        // Snap local time to remote BEFORE resuming so the transcript doesn't
-        // briefly show the stale paused position.
-        audioEl.currentTime = remotePlayer.currentTime;
+        // Resume local muted playback.  Don't snap audioEl.currentTime here —
+        // remotePlayer.currentTime often still reports the stale paused value
+        // at this moment, which causes the transcript to hang at the old
+        // position then skip forward once CURRENT_TIME_CHANGED catches up.
+        // The drift correction interval will align within ~500ms.
         _ensureLocalMutedPlayback();
       }
     }
   );
 
   // On discrete receiver-side seeks, snap local audioEl to match.
+  // When paused, only snap on large jumps (>2s) to catch deliberate seeks
+  // while avoiding the flicker loop from repeated small snaps.
   remotePlayerController.addEventListener(
     cast.framework.RemotePlayerEventType.CURRENT_TIME_CHANGED,
     () => {
-      if (remotePlayer.duration > 0 && Math.abs(audioEl.currentTime - remotePlayer.currentTime) > 1) {
+      if (remotePlayer.duration <= 0) return;
+      const drift = Math.abs(audioEl.currentTime - remotePlayer.currentTime);
+      if (remotePlayer.isPaused) {
+        // Large jump while paused = deliberate seek on receiver.
+        if (drift > 2) {
+          audioEl.currentTime = remotePlayer.currentTime;
+        }
+        return;
+      }
+      if (drift > 0.5) {
         audioEl.currentTime = remotePlayer.currentTime;
       }
     }
   );
 
   // Lightweight drift correction — the local muted audioEl may drift slightly
-  // from the receiver over time.  Every 2s, snap it back if the gap exceeds 1s.
+  // from the receiver over time.  Every 500ms, snap it back if drift exceeds 0.5s.
+  // Only corrects while the remote is playing to avoid flicker when paused.
   // Also recovers from the edge case where local playback was rejected the
   // first time (e.g. browser autoplay policy) — retries play() each cycle.
   castTimeSyncInterval = setInterval(() => {
     if (!_isCasting()) return;
+    if (remotePlayer.isPaused) return;
     // If remote is playing but local is paused, restart local muted playback.
-    if (!remotePlayer.isPaused && audioEl.paused) {
+    if (audioEl.paused) {
       castLog("INFO", "drift interval: remote playing but local paused — restarting");
       _ensureLocalMutedPlayback();
     }
     const drift = Math.abs(audioEl.currentTime - remotePlayer.currentTime);
-    if (drift > 1 && remotePlayer.duration > 0) {
+    if (drift > 0.5 && remotePlayer.duration > 0) {
       castLog("INFO", "drift correction:", drift.toFixed(1), "s");
       audioEl.currentTime = remotePlayer.currentTime;
     }
-  }, 2000);
+  }, 500);
 
   // Listen for custom namespace messages from the receiver (e.g. episode changes).
   session.addMessageListener(CAST_NAMESPACE, (_namespace, messageStr) => {
@@ -546,9 +566,10 @@ function setupCastSync(session) {
           return;
         }
         castLog("INFO", "receiver changed episode to:", msg.episodeId);
-        // Load episode locally AND on the cast session so the RemotePlayer
-        // tracks the media (needed for play/pause and drift correction).
-        loadEpisode(msg.episodeId);
+        // Load transcript + audio locally but do NOT send a LOAD back to the
+        // receiver — it already has the episode loaded.  The sender plays
+        // its local audioEl muted for transcript tracking independently.
+        loadEpisode(msg.episodeId, { skipCastLoad: true });
       }
     } catch (err) {
       castLog("ERROR", "sender Cast message parse error:", err.message);
@@ -804,6 +825,7 @@ function initCastReceiver() {
   castLog("OK", "CastReceiverContext found — initializing receiver");
   const context = castReceiverContext.getInstance();
   const playerManager = context.getPlayerManager();
+  receiverPlayerManager = playerManager;
 
   // Tell the Cast framework to use OUR <audio> element instead of creating
   // its own.  This eliminates the dual-media-element conflict that caused
@@ -843,16 +865,18 @@ function initCastReceiver() {
     castLog("INFO", "LOAD interceptor fired — contentUrl:", (request.media && request.media.contentUrl) || "(none)");
     const customData = request.media && request.media.customData;
     if (customData && customData.episodeId) {
-      castLog("INFO", "loading transcript for episode:", customData.episodeId);
-      // The framework will set audioEl.src from the LOAD request's contentUrl
-      // via setMediaElement — tell loadEpisode to skip the src assignment.
-      loadEpisode(customData.episodeId, { skipAudioSrc: true })
-        .catch((err) => { castLog("ERROR", "loadEpisode from LOAD interceptor failed:", err.message); });
+      // Skip re-loading if we already have this episode's transcript loaded
+      // (e.g. receiverEstablishMediaSession triggers LOAD after local loadEpisode).
+      if (customData.episodeId === currentEpisodeId && currentSegments.length > 0) {
+        castLog("INFO", "LOAD interceptor: episode already loaded, skipping transcript reload");
+      } else {
+        castLog("INFO", "loading transcript for episode:", customData.episodeId);
+        loadEpisode(customData.episodeId, { skipAudioSrc: true })
+          .catch((err) => { castLog("ERROR", "loadEpisode from LOAD interceptor failed:", err.message); });
+      }
     } else {
       castLog("WARN", "LOAD request had no customData.episodeId");
     }
-    // Return the request so the framework loads the authenticated media URL
-    // into audioEl (via setMediaElement).
     return request;
   });
 
@@ -938,6 +962,46 @@ function notifySenderEpisodeChanged(episodeId) {
   } catch (err) {
     castLog("WARN", "notifySenderEpisodeChanged failed:", err.message);
   }
+}
+
+/**
+ * Establish a Cast media session on the receiver so the sender's RemotePlayer
+ * tracks the media (play/pause, seek, duration).  Called when the receiver's
+ * own UI selects an episode — bypasses the sender's LOAD flow.
+ */
+function receiverEstablishMediaSession(episodeId) {
+  if (!receiverMode || !receiverPlayerManager) return;
+  const ep = episodes.find((item) => item.id === episodeId);
+  if (!ep) return;
+
+  // Build the authenticated media URL the same way the sender would.
+  let mediaUrl = `${window.location.origin}${ep.audio}`;
+  if (receiverAuthToken) {
+    const sep = mediaUrl.includes("?") ? "&" : "?";
+    mediaUrl = `${mediaUrl}${sep}rt=${encodeURIComponent(receiverAuthToken)}`;
+  }
+
+  castLog("INFO", "receiverEstablishMediaSession:", episodeId, mediaUrl);
+
+  // Use the playerManager.load() API to create a proper media session.
+  // This makes the sender's RemotePlayer recognise the active media.
+  const castFramework = window.cast && window.cast.framework;
+  if (!castFramework) return;
+
+  // Build a synthetic LOAD request data object for the player manager.
+  const loadRequestData = new castFramework.messages.LoadRequestData();
+  loadRequestData.media = new castFramework.messages.MediaInformation();
+  loadRequestData.media.contentId = mediaUrl;
+  loadRequestData.media.contentUrl = mediaUrl;
+  loadRequestData.media.contentType = "audio/mpeg";
+  loadRequestData.media.streamType = castFramework.messages.StreamType.BUFFERED;
+  loadRequestData.media.customData = { episodeId };
+  loadRequestData.autoplay = true;
+  loadRequestData.currentTime = 0;
+
+  receiverPlayerManager.load(loadRequestData)
+    .then(() => { castLog("OK", "receiver media session established for:", episodeId); })
+    .catch((err) => { castLog("ERROR", "receiver media session load failed:", err); });
 }
 
 async function loadEpisodesForReceiver() {
@@ -1237,9 +1301,14 @@ async function hydrateSegmentTranslations(loadToken) {
   void lazyTranslateAround(activeSegmentIndex, loadToken);
 }
 
+let _translatingAroundCenter = -1;
+
 async function lazyTranslateAround(center, loadToken) {
   if (loadToken !== activeEpisodeLoadToken || !currentSegments.length) return;
   if (center < 0) center = 0;
+  // Avoid re-entering for the same center — timeupdate fires frequently.
+  if (center === _translatingAroundCenter) return;
+  _translatingAroundCenter = center;
 
   // Translate a window of ±3 segments around the currently playing one.
   const LOOKAHEAD = 3;
@@ -1253,11 +1322,12 @@ async function lazyTranslateAround(center, loadToken) {
     if (center - d >= start) indices.push(center - d);
   }
 
+  // Translate the center segment first (await), then fire the rest in parallel.
   for (const index of indices) {
-    if (loadToken !== activeEpisodeLoadToken) return;
-    // Fire translations in parallel — don't await sequentially.
-    loadSegmentTranslation(index, loadToken);
+    if (loadToken !== activeEpisodeLoadToken) { _translatingAroundCenter = -1; return; }
+    await loadSegmentTranslation(index, loadToken);
   }
+  _translatingAroundCenter = -1;
 }
 
 function renderEpisodeList() {
@@ -1288,7 +1358,10 @@ function renderEpisodeList() {
     item.addEventListener("click", async () => {
       castLog("INFO", "episode item clicked:", ep.id);
       await loadEpisode(ep.id);
-      if (receiverMode) notifySenderEpisodeChanged(ep.id);
+      if (receiverMode) {
+        receiverEstablishMediaSession(ep.id);
+        notifySenderEpisodeChanged(ep.id);
+      }
     });
     episodeListEl.appendChild(item);
   }
@@ -1363,7 +1436,10 @@ async function selectEpisodeFromFsPicker() {
   castLog("INFO", "selectEpisodeFromFsPicker:", ep.id, "index:", fsEpisodePickerIndex);
   closeFsEpisodePicker();
   await loadEpisode(ep.id);
-  if (receiverMode) notifySenderEpisodeChanged(ep.id);
+  if (receiverMode) {
+    receiverEstablishMediaSession(ep.id);
+    notifySenderEpisodeChanged(ep.id);
+  }
 }
 
 function renderSegments(segments) {
