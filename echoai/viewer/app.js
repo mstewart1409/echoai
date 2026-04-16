@@ -133,7 +133,164 @@ const urlParams = new URLSearchParams(window.location.search);
 const receiverMode = urlParams.get("mode") === "receiver" || urlParams.get("receiver") === "1";
 const castDebugEnabled = urlParams.get("castDebug") === "1";
 
-// ...existing code... (Cast Debug Logger section stays as-is)
+// ── Cast Debug Logger ────────────────────────────────────────────────────────
+// On-screen debug panel for diagnosing Cast issues on Chromecast devices where
+// there are no browser DevTools.  Activated by ?castDebug=1 or long-pressing
+// the Play/Pause button (1.6s) in fullscreen/receiver mode.
+const CAST_LOG_MAX = 200;             // Max retained log entries (circular buffer)
+const castLogEntries = [];            // Ring buffer of {ts, level, msg} log entries
+let castDebugPanelEl = null;          // Root DOM element of the debug panel (created lazily)
+let castDebugPanelBodyEl = null;      // Scrollable body div inside the debug panel
+
+let castDebugFullscreen = false;      // Whether the debug panel is currently shown fullscreen
+
+/**
+ * Lazily create the on-screen debug panel DOM.  Called on first castLog() when
+ * ?castDebug=1 is set, or when the user long-presses the Play/Pause button.
+ * Idempotent — returns immediately if the panel already exists.
+ */
+function _ensureCastDebugPanel() {
+  if (castDebugPanelEl) return;
+  castDebugPanelEl = document.createElement("div");
+  castDebugPanelEl.id = "castDebugPanel";
+  castDebugPanelEl.className = "cast-debug-panel";
+
+  // Header bar with title and action buttons.
+  const header = document.createElement("div");
+  header.className = "cast-debug-header";
+  header.innerHTML =
+    '<span style="font-weight:bold;color:#0f0">🔊 Cast Debug</span>';
+  const btnGroup = document.createElement("span");
+
+  // "Copy" button — copies all log entries to clipboard as plain text.
+  const copyBtn = document.createElement("button");
+  copyBtn.textContent = "Copy";
+  copyBtn.tabIndex = -1;  // Exclude from D-pad tab order on Chromecast
+  copyBtn.className = "cast-debug-btn";
+  copyBtn.addEventListener("click", () => {
+    const text = castLogEntries.map((e) => `[${e.ts}] ${e.level} ${e.msg}`).join("\n");
+    navigator.clipboard.writeText(text).catch(() => {});
+  });
+
+  // "Clear" button — empties both the in-memory buffer and the panel DOM.
+  const clearBtn = document.createElement("button");
+  clearBtn.textContent = "Clear";
+  clearBtn.tabIndex = -1;
+  clearBtn.className = "cast-debug-btn";
+  clearBtn.addEventListener("click", () => {
+    castLogEntries.length = 0;
+    if (castDebugPanelBodyEl) castDebugPanelBodyEl.innerHTML = "";
+  });
+
+  // "✕" close button — hides the panel without destroying it.
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "✕";
+  closeBtn.tabIndex = -1;
+  closeBtn.className = "cast-debug-btn cast-debug-close-btn";
+  closeBtn.addEventListener("click", () => {
+    hideCastDebugPanel();
+  });
+
+  // Assemble header: [title] [Copy] [Clear] [✕]
+  btnGroup.appendChild(copyBtn);
+  btnGroup.appendChild(clearBtn);
+  btnGroup.appendChild(closeBtn);
+  header.appendChild(btnGroup);
+  castDebugPanelEl.appendChild(header);
+
+  // Scrollable body where individual log lines are appended.
+  castDebugPanelBodyEl = document.createElement("div");
+  castDebugPanelBodyEl.className = "cast-debug-body";
+  castDebugPanelEl.appendChild(castDebugPanelBodyEl);
+  document.body.appendChild(castDebugPanelEl);
+}
+
+/**
+ * Show the debug panel in fullscreen overlay mode.
+ * Back-fills any log entries that were captured before the panel was opened.
+ */
+function showCastDebugPanel() {
+  _ensureCastDebugPanel();
+  castDebugFullscreen = true;
+  castDebugPanelEl.classList.add("fullscreen");
+  castDebugPanelEl.style.display = "";
+  // Back-fill existing log entries into the panel body (only if empty,
+  // i.e. the panel was just created or was cleared).
+  if (castDebugPanelBodyEl && castDebugPanelBodyEl.children.length === 0) {
+    for (const entry of castLogEntries) {
+      const line = document.createElement("div");
+      const color = entry.level === "ERROR" ? "#f44" : entry.level === "WARN" ? "#fa0" : entry.level === "OK" ? "#4f4" : "#0f0";
+      line.style.cssText = `color:${color};word-break:break-all;border-bottom:1px solid #111;padding:1px 0;`;
+      line.textContent = `${entry.ts} ${entry.level} ${entry.msg}`;
+      castDebugPanelBodyEl.appendChild(line);
+    }
+  }
+  // Auto-scroll to the latest entry.
+  castDebugPanelEl.scrollTop = castDebugPanelEl.scrollHeight;
+  castLog("INFO", "debug panel opened (fullscreen)");
+}
+
+/** Hide the debug panel (keeps DOM + log buffer intact for re-opening). */
+function hideCastDebugPanel() {
+  if (!castDebugPanelEl) return;
+  castDebugFullscreen = false;
+  castDebugPanelEl.classList.remove("fullscreen");
+  castDebugPanelEl.style.display = "none";
+  castLog("INFO", "debug panel closed");
+}
+
+/** Toggle debug panel visibility — called by long-press on Play/Pause. */
+function toggleCastDebugPanel() {
+  _ensureCastDebugPanel();
+  if (castDebugFullscreen) {
+    hideCastDebugPanel();
+  } else {
+    showCastDebugPanel();
+  }
+}
+
+/**
+ * Central logging function for all Cast-related activity.
+ * - Always logs to browser console (error/warn/log based on level).
+ * - Stores entries in a bounded ring buffer (CAST_LOG_MAX entries).
+ * - When the debug panel is active (?castDebug=1 or long-press toggle),
+ *   also appends a colour-coded line to the on-screen panel.
+ *
+ * Levels: "ERROR" (red), "WARN" (orange), "OK" (green), "INFO" (lime).
+ *
+ * @param {string} level - Log level: "ERROR", "WARN", "OK", or "INFO".
+ * @param {...*} args - Values to log (objects are JSON-stringified).
+ */
+function castLog(level, ...args) {
+  const ts = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+  const msg = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
+  const tag = `[Cast/${level}]`;
+
+  // Route to the appropriate console method for browser DevTools filtering.
+  if (level === "ERROR") {
+    console.error(tag, ...args);
+  } else if (level === "WARN") {
+    console.warn(tag, ...args);
+  } else {
+    console.log(tag, ...args);
+  }
+
+  // Append to the bounded ring buffer (drop oldest when full).
+  castLogEntries.push({ ts, level, msg });
+  if (castLogEntries.length > CAST_LOG_MAX) castLogEntries.shift();
+
+  // If the on-screen debug panel is active, render the entry there too.
+  if (castDebugEnabled || castDebugFullscreen) {
+    _ensureCastDebugPanel();
+    const line = document.createElement("div");
+    const color = level === "ERROR" ? "#f44" : level === "WARN" ? "#fa0" : level === "OK" ? "#4f4" : "#0f0";
+    line.style.cssText = `color:${color};word-break:break-all;border-bottom:1px solid #111;padding:1px 0;`;
+    line.textContent = `${ts} ${level} ${msg}`;
+    castDebugPanelBodyEl.appendChild(line);
+    castDebugPanelEl.scrollTop = castDebugPanelEl.scrollHeight;
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ── Application state ────────────────────────────────────────────────────────
 let episodes = [];                    // Full episode list from /api/episodes
