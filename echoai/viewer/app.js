@@ -1,3 +1,106 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// app.js — EchoAI Transcript Viewer (German Podcast Language Learning Tool)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// PURPOSE:
+//   Interactive transcript viewer for German podcast episodes.  Displays
+//   word-level and segment-level transcripts with audio synchronisation,
+//   hover-to-translate (DE→EN via Google Translate), grammar analysis (spaCy),
+//   and Chromecast support for casting audio to a TV/speaker while keeping
+//   transcript tracking on the sender (browser).
+//
+// ── DUAL-MODE ARCHITECTURE ──────────────────────────────────────────────────
+//
+//   This single file runs in TWO modes, determined by the URL query string:
+//
+//   1. SENDER MODE (default)
+//      - Normal browser tab.  User browses episodes, plays audio locally,
+//        sees transcript tracking.  Can cast to a Chromecast.
+//      - When casting: local audio is MUTED (not paused).  The muted local
+//        <audio> element continues to play in sync with the receiver so its
+//        native `timeupdate` event drives transcript highlighting.  The
+//        sender's RemotePlayer + RemotePlayerController track the receiver's
+//        media state (play/pause, seek, duration).
+//
+//   2. RECEIVER MODE (?mode=receiver)
+//      - Loaded by the Chromecast device as a Custom Receiver app.
+//      - Enters fullscreen immediately.  Shows transcript + episode picker.
+//      - The Cast framework's `playerManager.setMediaElement(audioEl)` binds
+//        the framework to OUR <audio> element, so LOAD/PLAY/PAUSE/SEEK
+//        commands from the sender drive audioEl directly.
+//      - Auth tokens arrive via a custom Cast namespace message from sender.
+//
+// ── CAST SYNCHRONISATION MODEL ──────────────────────────────────────────────
+//
+//   The key challenge: keep the sender's transcript highlighting in sync with
+//   the receiver's audio playback across the Cast protocol's ~200-500ms latency.
+//
+//   Approach: the sender plays its own muted copy of the audio.  Its native
+//   `timeupdate` event (fired by the browser's media pipeline) drives all
+//   transcript highlighting — no polling of remotePlayer.currentTime for UI.
+//   A 500ms drift-correction interval snaps the muted local audio to the
+//   receiver's reported position when they diverge by more than 0.5s.
+//
+//   WHY NOT just poll remotePlayer.currentTime?
+//   - RemotePlayer updates are asynchronous and coarse (~1s granularity).
+//   - Using it directly for transcript tracking produces jerky, delayed updates.
+//   - The local muted audio gives smooth, browser-native timeupdate (~4Hz).
+//
+//   SYNC EVENTS (sender side, in setupCastSync):
+//   - IS_PAUSED_CHANGED: mirrors pause/play to local audioEl.
+//     · On PAUSE: just pause local audio in place (don't snap time — avoids
+//       visible backward jump from Cast event latency).
+//     · On PLAY: resume local muted playback; drift correction aligns in 500ms.
+//   - CURRENT_TIME_CHANGED: snaps local time on large drifts (>0.5s playing,
+//     >2s paused) to catch deliberate seeks without causing flicker loops.
+//   - 500ms setInterval: drift correction + autoplay-policy recovery.
+//
+// ── EPISODE LOADING ON RECEIVER ─────────────────────────────────────────────
+//
+//   When the RECEIVER's UI selects an episode (D-pad / episode picker):
+//   1. receiverEstablishMediaSession(episodeId) is called — NOT loadEpisode().
+//   2. This calls playerManager.load() with a synthetic LoadRequestData
+//      containing the authenticated media URL and episodeId in customData.
+//   3. The LOAD interceptor fires, calling loadEpisode(id, {skipAudioSrc:true})
+//      to load the transcript without touching audioEl.src (the framework
+//      handles that via setMediaElement).
+//   4. notifySenderEpisodeChanged(episodeId) tells the sender to load the
+//      transcript locally with skipCastLoad:true (don't LOAD back to receiver).
+//
+//   WHY NOT call loadEpisode() directly on the receiver?
+//   - loadEpisode sets audioEl.src, which conflicts with the Cast framework's
+//     own media loading (via setMediaElement).  The play() from loadEpisode
+//     gets interrupted by the framework's load, causing MEDIA_ELEMENT_ERROR
+//     (code 104) and LOAD_FAILED (code 905).
+//
+//   When the SENDER selects an episode while casting:
+//   1. loadEpisode(id) runs normally (sets audioEl.src for muted local copy).
+//   2. loadCurrentEpisodeOnCastSession() sends a LOAD to the receiver via
+//      session.loadMedia() with an authenticated media URL + customData.
+//   3. The receiver's LOAD interceptor fires, loading the transcript.
+//
+// ── AUTH MODEL ──────────────────────────────────────────────────────────────
+//
+//   - Sender: authenticated via session cookie (login prompt on first load).
+//   - Receiver (Chromecast): no cookies.  Auth token sent via custom Cast
+//     namespace message ("urn:x-cast:com.echoai.auth") immediately after
+//     session start.  The token is refreshed at 80% of its TTL to prevent
+//     401 errors on long-running sessions.
+//   - The receiver stores the token in `receiverAuthToken` and attaches it
+//     as an X-Cast-Token header on all fetchJson() calls, and as ?rt= on
+//     media URLs.
+//
+// ── TRANSLATION LOADING ─────────────────────────────────────────────────────
+//
+//   Segment translations (DE→EN) are loaded lazily — only ±3 segments around
+//   the currently playing segment.  This avoids overwhelming the single-threaded
+//   Flask server (each translation hits Google Translate with a 6s timeout).
+//   A re-entry guard (_translatingAroundCenter) prevents duplicate requests
+//   from frequent timeupdate calls.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── DOM element references ───────────────────────────────────────────────────
 const episodeListEl = document.getElementById("episodeList");
 const statusTextEl = document.getElementById("statusText");
 const searchInputEl = document.getElementById("searchInput");
@@ -21,176 +124,85 @@ const receiverEpisodesBtnEl = document.getElementById("receiverEpisodesBtn");
 const fsEpisodePickerEl = document.getElementById("fsEpisodePicker");
 const fsEpisodePickerListEl = document.getElementById("fsEpisodePickerList");
 const fsEpisodePickerCloseBtnEl = document.getElementById("fsEpisodePickerCloseBtn");
+
+// ── Mode detection from URL query parameters ─────────────────────────────────
+// ?mode=receiver  → Chromecast receiver mode (fullscreen, no local controls)
+// ?castDebug=1    → show live Cast debug log panel
+// ?receiverAppId=XXXX → override Cast receiver app ID
 const urlParams = new URLSearchParams(window.location.search);
 const receiverMode = urlParams.get("mode") === "receiver" || urlParams.get("receiver") === "1";
 const castDebugEnabled = urlParams.get("castDebug") === "1";
 
-// ── Cast Debug Logger ────────────────────────────────────────────────────────
-const CAST_LOG_MAX = 200;
-const castLogEntries = [];
-let castDebugPanelEl = null;
-let castDebugPanelBodyEl = null;
+// ...existing code... (Cast Debug Logger section stays as-is)
 
-let castDebugFullscreen = false;
+// ── Application state ────────────────────────────────────────────────────────
+let episodes = [];                    // Full episode list from /api/episodes
+let filteredEpisodes = [];            // Filtered by search input
+let currentEpisodeId = null;          // Currently loaded episode ID
+let currentSegments = [];             // Transcript segments [{start, end, text, translation_en}]
+let currentWords = [];                // Word-level tokens [{word, start, end, probability, context}]
+let segmentWordRanges = [];           // Maps segment index → {start, end} indices into currentWords
+let activeSegmentIndex = -1;          // Currently highlighted segment in normal view
+let activeWordIndex = -1;             // Currently highlighted word in normal view
+let translationsVisible = true;       // Whether EN translation captions are shown
 
-function _ensureCastDebugPanel() {
-  if (castDebugPanelEl) return;
-  castDebugPanelEl = document.createElement("div");
-  castDebugPanelEl.id = "castDebugPanel";
-  castDebugPanelEl.className = "cast-debug-panel";
-  const header = document.createElement("div");
-  header.className = "cast-debug-header";
-  header.innerHTML =
-    '<span style="font-weight:bold;color:#0f0">🔊 Cast Debug</span>';
-  const btnGroup = document.createElement("span");
+// ── Fullscreen / receiver UI state ───────────────────────────────────────────
+let isFullscreen = false;             // Whether fullscreen overlay is active
+let fsActiveSegmentIndex = -1;        // Currently highlighted segment in fullscreen
+let fsActiveWordIndex = -1;           // Currently highlighted word in fullscreen
+const translationCache = new Map();   // Word translation cache (word||context → {display, translation})
+const segmentTranslationCache = new Map(); // Segment translation cache (text → translation)
+let hoverTimer = null;                // Debounce timer for word hover tooltip
+let hideTimer = null;                 // Delay timer for tooltip hide
+let activeEpisodeLoadToken = 0;       // Monotonic token to cancel stale loadEpisode() calls
+let isFsEpisodePickerOpen = false;    // Whether the fullscreen episode picker overlay is open
+let fsEpisodePickerIndex = -1;        // Currently highlighted episode in the picker
 
-  const copyBtn = document.createElement("button");
-  copyBtn.textContent = "Copy";
-  copyBtn.tabIndex = -1;
-  copyBtn.className = "cast-debug-btn";
-  copyBtn.addEventListener("click", () => {
-    const text = castLogEntries.map((e) => `[${e.ts}] ${e.level} ${e.msg}`).join("\n");
-    navigator.clipboard.writeText(text).catch(() => {});
-  });
+// ── Cast state (sender side) ─────────────────────────────────────────────────
+let castSession = null;               // Active CastSession (set by SESSION_STATE_CHANGED)
+let isCastReady = false;              // Whether the Cast SDK has initialized
+let runtimeConfig = {};               // Server config from /api/config
+const CAST_NAMESPACE = "urn:x-cast:com.echoai.auth"; // Custom namespace for auth + episode messages
 
-  const clearBtn = document.createElement("button");
-  clearBtn.textContent = "Clear";
-  clearBtn.tabIndex = -1;
-  clearBtn.className = "cast-debug-btn";
-  clearBtn.addEventListener("click", () => {
-    castLogEntries.length = 0;
-    if (castDebugPanelBodyEl) castDebugPanelBodyEl.innerHTML = "";
-  });
+// ── Cast state (receiver side) ───────────────────────────────────────────────
+let receiverAuthToken = null;         // Auth token received from sender via Cast namespace
+let receiverPlayerManager = null;     // Cast PlayerManager instance (receiver only)
 
-  const closeBtn = document.createElement("button");
-  closeBtn.textContent = "✕";
-  closeBtn.tabIndex = -1;
-  closeBtn.className = "cast-debug-btn cast-debug-close-btn";
-  closeBtn.addEventListener("click", () => {
-    hideCastDebugPanel();
-  });
+// ── Bidirectional Cast sync state (sender side) ──────────────────────────────
+// These are only used on the sender to track the receiver's media state.
+let remotePlayer = null;              // cast.framework.RemotePlayer — tracks receiver state
+let remotePlayerController = null;    // cast.framework.RemotePlayerController — sends commands
+let castTimeSyncInterval = null;      // 500ms drift correction interval ID
+let castTokenRefreshInterval = null;  // Periodic auth token refresh interval ID
 
-  btnGroup.appendChild(copyBtn);
-  btnGroup.appendChild(clearBtn);
-  btnGroup.appendChild(closeBtn);
-  header.appendChild(btnGroup);
-  castDebugPanelEl.appendChild(header);
-
-  castDebugPanelBodyEl = document.createElement("div");
-  castDebugPanelBodyEl.className = "cast-debug-body";
-  castDebugPanelEl.appendChild(castDebugPanelBodyEl);
-  document.body.appendChild(castDebugPanelEl);
-}
-
-function showCastDebugPanel() {
-  _ensureCastDebugPanel();
-  castDebugFullscreen = true;
-  castDebugPanelEl.classList.add("fullscreen");
-  castDebugPanelEl.style.display = "";
-  // Back-fill existing log entries into the panel body.
-  if (castDebugPanelBodyEl && castDebugPanelBodyEl.children.length === 0) {
-    for (const entry of castLogEntries) {
-      const line = document.createElement("div");
-      const color = entry.level === "ERROR" ? "#f44" : entry.level === "WARN" ? "#fa0" : entry.level === "OK" ? "#4f4" : "#0f0";
-      line.style.cssText = `color:${color};word-break:break-all;border-bottom:1px solid #111;padding:1px 0;`;
-      line.textContent = `${entry.ts} ${entry.level} ${entry.msg}`;
-      castDebugPanelBodyEl.appendChild(line);
-    }
-  }
-  castDebugPanelEl.scrollTop = castDebugPanelEl.scrollHeight;
-  castLog("INFO", "debug panel opened (fullscreen)");
-}
-
-function hideCastDebugPanel() {
-  if (!castDebugPanelEl) return;
-  castDebugFullscreen = false;
-  castDebugPanelEl.classList.remove("fullscreen");
-  castDebugPanelEl.style.display = "none";
-  castLog("INFO", "debug panel closed");
-}
-
-function toggleCastDebugPanel() {
-  _ensureCastDebugPanel();
-  if (castDebugFullscreen) {
-    hideCastDebugPanel();
-  } else {
-    showCastDebugPanel();
-  }
-}
-
-function castLog(level, ...args) {
-  const ts = new Date().toISOString().slice(11, 23);
-  const msg = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
-  const tag = `[Cast/${level}]`;
-
-  if (level === "ERROR") {
-    console.error(tag, ...args);
-  } else if (level === "WARN") {
-    console.warn(tag, ...args);
-  } else {
-    console.log(tag, ...args);
-  }
-
-  castLogEntries.push({ ts, level, msg });
-  if (castLogEntries.length > CAST_LOG_MAX) castLogEntries.shift();
-
-  if (castDebugEnabled || castDebugFullscreen) {
-    _ensureCastDebugPanel();
-    const line = document.createElement("div");
-    const color = level === "ERROR" ? "#f44" : level === "WARN" ? "#fa0" : level === "OK" ? "#4f4" : "#0f0";
-    line.style.cssText = `color:${color};word-break:break-all;border-bottom:1px solid #111;padding:1px 0;`;
-    line.textContent = `${ts} ${level} ${msg}`;
-    castDebugPanelBodyEl.appendChild(line);
-    castDebugPanelEl.scrollTop = castDebugPanelEl.scrollHeight;
-  }
-}
 // ─────────────────────────────────────────────────────────────────────────────
-
-let episodes = [];
-let filteredEpisodes = [];
-let currentEpisodeId = null;
-let currentSegments = [];
-let currentWords = [];
-let segmentWordRanges = [];  // [{start: globalWordIdx, end: globalWordIdx}] per segment
-let activeSegmentIndex = -1;
-let activeWordIndex = -1;
-let translationsVisible = true;
-
-let isFullscreen = false;
-let fsActiveSegmentIndex = -1;
-let fsActiveWordIndex = -1;
-const translationCache = new Map();
-const segmentTranslationCache = new Map();
-let hoverTimer = null;
-let hideTimer = null;
-let activeEpisodeLoadToken = 0;
-let isFsEpisodePickerOpen = false;
-let fsEpisodePickerIndex = -1;
-let castSession = null;
-let isCastReady = false;
-let runtimeConfig = {};
-const CAST_NAMESPACE = "urn:x-cast:com.echoai.auth";
-let receiverAuthToken = null;
-let receiverPlayerManager = null;
-
-// ── Bidirectional Cast sync state ────────────────────────────────────────────
-let remotePlayer = null;
-let remotePlayerController = null;
-let castTimeSyncInterval = null;
-let castTokenRefreshInterval = null;
 
 /**
  * Whether we have an active Cast session.  Uses `castSession` (set reliably
  * by SESSION_STATE_CHANGED) rather than `remotePlayer.isConnected` which can
  * lag behind or require media to be loaded first.
+ *
+ * IMPORTANT: On the receiver, castSession and remotePlayerController are always
+ * null — _isCasting() always returns false on the receiver.  This is correct:
+ * the receiver doesn't "cast to itself".  Functions like _seekTo() and
+ * togglePlayPause() use _isCasting() to decide whether to mirror actions to
+ * the Chromecast, which only makes sense on the sender.
  */
 function _isCasting() {
   return !!(castSession && remotePlayerController);
 }
 
 /**
- * Seek to a time.  When casting, seek both the local (muted) audioEl — which
- * drives transcript tracking via its native timeupdate — and the Chromecast.
+ * Seek to a time position.  When casting, seek both:
+ * 1. The local (muted) audioEl — drives transcript tracking via timeupdate.
+ * 2. The Chromecast receiver — via remotePlayerController.seek().
+ *
+ * On the receiver, _isCasting() is false, so only audioEl is seeked directly.
+ * The Cast framework (which owns audioEl via setMediaElement) then reports the
+ * new position to the sender's RemotePlayer.
+ *
+ * @param {number} time - Seek target in seconds.
+ * @param {boolean} autoPlay - If true, also start playback if paused.
  */
 function _seekTo(time, autoPlay = true) {
   audioEl.currentTime = time;
@@ -230,8 +242,14 @@ function _unmuteSenderForCast() {
 /**
  * Ensure the sender's local audio is playing muted so that its native
  * `timeupdate` event drives transcript tracking and the HTML5 player UI
- * shows the correct time position.  Safe to call repeatedly — no-ops if
- * already playing.  Handles promise rejection gracefully.
+ * shows the correct time position.
+ *
+ * WHY MUTED PLAYBACK instead of pausing + polling?
+ * - The browser's native timeupdate fires at ~4Hz with sub-100ms accuracy.
+ * - Polling remotePlayer.currentTime gives ~1s granularity with network lag.
+ * - Muted playback is zero-cost (decoded but not sent to speakers).
+ *
+ * Safe to call repeatedly — no-ops if already playing.
  */
 function _ensureLocalMutedPlayback() {
   if (receiverMode) return;
@@ -271,6 +289,7 @@ let tooltipWord = "";
 let tooltipContext = "";
 
 function formatTime(seconds) {
+  // Clamp to non-negative, floor to whole seconds, format as HH:MM:SS or MM:SS.
   const s = Math.max(0, Math.floor(seconds));
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
@@ -282,6 +301,7 @@ function formatTime(seconds) {
 }
 
 async function fetchJson(url) {
+  // Attach Cast auth token header when running on receiver (no cookies available).
   const headers = {};
   if (receiverAuthToken) {
     headers["X-Cast-Token"] = receiverAuthToken;
@@ -296,6 +316,8 @@ async function fetchJson(url) {
 }
 
 function getCastReceiverAppId() {
+  // Priority: URL query param > localStorage override > server config > default.
+  // The default CC1AD845 is Google's Default Media Receiver (for testing only).
   const fromQuery = new URLSearchParams(window.location.search).get("receiverAppId");
   if (fromQuery) { castLog("INFO", "appId from query:", fromQuery); return fromQuery; }
   const fromStorage = localStorage.getItem("castReceiverAppId");
@@ -306,7 +328,8 @@ function getCastReceiverAppId() {
 }
 
 async function ensureAuthenticatedSession() {
-  // In receiver mode, try token from query string first (passed by sender).
+  // Receiver mode: auth comes via Cast namespace message, not cookies.
+  // In browser testing (?mode=receiver), a query-string token can be used instead.
   if (receiverMode) {
     const tokenFromQuery = new URLSearchParams(window.location.search).get("rt");
     if (tokenFromQuery) {
@@ -386,6 +409,8 @@ async function loadRuntimeConfig() {
 }
 
 function updateCastButtonState() {
+  // Sync the Cast button's visibility and label with the current Cast state.
+  // Hidden until the Cast SDK has initialized (device discovery is async).
   if (!castBtnEl) return;
   if (!isCastReady) {
     castBtnEl.classList.add("hidden");
@@ -414,6 +439,8 @@ function updateCastButtonState() {
 }
 
 function getCurrentEpisodeMeta() {
+  // Build an absolute media URL for the current episode — Chromecast needs
+  // a full URL since it loads media from its own network stack (no cookies).
   if (!currentEpisodeId) return null;
   const ep = episodes.find((item) => item.id === currentEpisodeId);
   if (!ep) return null;
@@ -428,6 +455,8 @@ function getCurrentEpisodeMeta() {
 }
 
 async function loadCurrentEpisodeOnCastSession(session, startTime = 0) {
+  // Called by the SENDER to load media on the Chromecast.  Appends a short-lived
+  // auth token to the media URL since the receiver can't use session cookies.
   const meta = getCurrentEpisodeMeta();
   if (!meta) { castLog("WARN", "loadCurrentEpisodeOnCastSession: no episode meta"); return; }
 
@@ -731,6 +760,8 @@ function initCastSender() {
 }
 
 async function sendAuthToReceiver(session) {
+  // Brief delay lets the receiver finish initializing its Cast context and
+  // namespace listener before we send the token message.
   castLog("INFO", "sendAuthToReceiver: waiting 500ms for receiver startup...");
   await new Promise((r) => setTimeout(r, 500));
   const ttl = await _mintAndSendCastToken(session);
@@ -812,6 +843,9 @@ function _castErrorName(code) {
 }
 
 function initCastReceiver() {
+  // The Cast Receiver SDK is loaded by the Chromecast device itself — it may
+  // not be available immediately when this function first runs.  We retry
+  // with a 200ms delay until the SDK appears.
   castLog("INFO", "initCastReceiver called");
   const castReceiverContext = window.cast && window.cast.framework &&
     window.cast.framework.CastReceiverContext;
@@ -835,6 +869,9 @@ function initCastReceiver() {
   castLog("INFO", "playerManager.setMediaElement bound to audioEl");
 
   // Listen for auth token from sender via custom namespace.
+  // The sender calls sendAuthToReceiver() ~500ms after session start.
+  // Until the token arrives, all fetchJson() calls will lack the header
+  // and return 401 — this is expected and handled gracefully.
   context.addCustomMessageListener(CAST_NAMESPACE, (event) => {
     castLog("INFO", "received custom message on namespace:", CAST_NAMESPACE);
     try {
@@ -865,15 +902,9 @@ function initCastReceiver() {
     castLog("INFO", "LOAD interceptor fired — contentUrl:", (request.media && request.media.contentUrl) || "(none)");
     const customData = request.media && request.media.customData;
     if (customData && customData.episodeId) {
-      // Skip re-loading if we already have this episode's transcript loaded
-      // (e.g. receiverEstablishMediaSession triggers LOAD after local loadEpisode).
-      if (customData.episodeId === currentEpisodeId && currentSegments.length > 0) {
-        castLog("INFO", "LOAD interceptor: episode already loaded, skipping transcript reload");
-      } else {
-        castLog("INFO", "loading transcript for episode:", customData.episodeId);
-        loadEpisode(customData.episodeId, { skipAudioSrc: true })
-          .catch((err) => { castLog("ERROR", "loadEpisode from LOAD interceptor failed:", err.message); });
-      }
+      castLog("INFO", "loading transcript for episode:", customData.episodeId);
+      loadEpisode(customData.episodeId, { skipAudioSrc: true })
+        .catch((err) => { castLog("ERROR", "loadEpisode from LOAD interceptor failed:", err.message); });
     } else {
       castLog("WARN", "LOAD request had no customData.episodeId");
     }
@@ -887,7 +918,10 @@ function initCastReceiver() {
     castLog("ERROR", `receiver playerManager error: ${code} (${name})`, reason);
   });
 
-  // Start the receiver with the custom namespace registered.
+  // Start the receiver with our custom settings:
+  // - disableIdleTimeout: prevent Chromecast from closing the app after inactivity
+  // - touchScreenOptimizedApp: suppress the default Cast media overlay
+  // - autoResumeDuration: 0 means don't auto-resume from previous session
   castLog("INFO", "starting CastReceiverContext with namespace:", CAST_NAMESPACE);
   const options = new cast.framework.CastReceiverOptions();
   options.customNamespaces = {};
@@ -948,6 +982,9 @@ function initCastReceiver() {
  * Only sends when running as a Cast receiver with an active sender connection.
  */
 function notifySenderEpisodeChanged(episodeId) {
+  // Receiver → sender notification via the custom Cast namespace.
+  // The sender's setupCastSync() message listener picks this up and calls
+  // loadEpisode(id, { skipCastLoad: true }) to sync the transcript locally.
   if (!receiverMode) return;
   try {
     const ctx = window.cast && window.cast.framework &&
@@ -965,9 +1002,24 @@ function notifySenderEpisodeChanged(episodeId) {
 }
 
 /**
- * Establish a Cast media session on the receiver so the sender's RemotePlayer
- * tracks the media (play/pause, seek, duration).  Called when the receiver's
- * own UI selects an episode — bypasses the sender's LOAD flow.
+ * Establish a Cast media session on the RECEIVER when the receiver's own UI
+ * selects an episode (D-pad navigation, episode picker).
+ *
+ * This is the ONLY correct way to load an episode on the receiver.  It calls
+ * playerManager.load() with a synthetic LoadRequestData, which:
+ * 1. Creates a proper Cast media session (so the sender's RemotePlayer tracks it)
+ * 2. Sets audioEl.src via the framework's setMediaElement binding
+ * 3. Triggers the LOAD interceptor, which loads the transcript via loadEpisode()
+ *
+ * WHY NOT call loadEpisode() + audioEl.play() directly?
+ * - loadEpisode sets audioEl.src, then play() starts it.
+ * - Then receiverEstablishMediaSession calls playerManager.load(), which also
+ *   tries to load media into audioEl via setMediaElement.
+ * - The two loads conflict: play() is interrupted → MEDIA_ELEMENT_ERROR (104),
+ *   LOAD_FAILED (905).
+ * - Solution: only go through playerManager.load() — let the framework own audioEl.
+ *
+ * @param {string} episodeId - The episode to load.
  */
 function receiverEstablishMediaSession(episodeId) {
   if (!receiverMode || !receiverPlayerManager) return;
@@ -1005,6 +1057,9 @@ function receiverEstablishMediaSession(episodeId) {
 }
 
 async function loadEpisodesForReceiver() {
+  // Called when the receiver gets its auth token — fetches the episode list
+  // and renders it.  Idempotent: skips if episodes are already loaded (e.g.
+  // from the eager cookie-auth attempt in init()).
   castLog("INFO", "loadEpisodesForReceiver called");
   if (episodes.length) {
     castLog("INFO", "episodes already loaded — skipping");
@@ -1026,6 +1081,7 @@ async function loadEpisodesForReceiver() {
 }
 
 function hideTooltip() {
+  // Immediately hide the translation tooltip and cancel any pending hide timer.
   if (hideTimer) {
     clearTimeout(hideTimer);
     hideTimer = null;
@@ -1034,6 +1090,7 @@ function hideTooltip() {
 }
 
 function showTooltip(text, x, y, showExplain = false) {
+  // Position the tooltip near the cursor with a 12px offset to avoid overlap.
   tooltipTextEl.textContent = text;
   tooltipEl.style.left = `${x + 12}px`;
   tooltipEl.style.top = `${y + 12}px`;
@@ -1042,11 +1099,15 @@ function showTooltip(text, x, y, showExplain = false) {
 }
 
 function hideTooltipSoon(delay = 180) {
+  // Schedule tooltip hide after a short delay — allows the user to move their
+  // mouse into the tooltip itself (to click "Explain to me") without it vanishing.
   if (hideTimer) clearTimeout(hideTimer);
   hideTimer = setTimeout(() => hideTooltip(), delay);
 }
 
 tooltipEl.addEventListener("mouseenter", () => {
+  // Cancel the hide timer when the mouse enters the tooltip itself,
+  // allowing the user to interact with the "Explain to me" button.
   if (hideTimer) {
     clearTimeout(hideTimer);
     hideTimer = null;
@@ -1056,6 +1117,8 @@ tooltipEl.addEventListener("mouseenter", () => {
 tooltipEl.addEventListener("mouseleave", () => hideTooltipSoon(120));
 
 tooltipExplainBtnEl.addEventListener("click", async () => {
+  // "Explain to me" button: fetches a grammar/usage explanation from the server
+  // (backed by an LLM) and replaces the tooltip content with a detailed breakdown.
   if (!tooltipWord) return;
   try {
     tooltipExplainBtnEl.disabled = true;
@@ -1085,6 +1148,9 @@ tooltipExplainBtnEl.addEventListener("click", async () => {
 });
 
 async function translateWord(word, context) {
+  // Look up a single German word → English translation with morphological info.
+  // Results are cached by (lowercase word + truncated context) to avoid
+  // redundant API calls for the same word in the same sentence.
   const clean = word.trim().toLowerCase();
   const cacheKey = `${clean}||${(context || "").substring(0, 40)}`;
   if (!clean) return "";
@@ -1104,6 +1170,8 @@ async function translateWord(word, context) {
 }
 
 async function translateSegmentText(text) {
+  // Translate a full German segment (sentence) to English.
+  // Cached by exact text to avoid re-translating on repeated timeupdate calls.
   const clean = (text || "").trim();
   if (!clean) return "";
   if (segmentTranslationCache.has(clean)) return segmentTranslationCache.get(clean);
@@ -1121,6 +1189,10 @@ async function translateSegmentText(text) {
 }
 
 function attachWordHover(node, word, context) {
+  // Wire up mouse events on a word span for hover-to-translate:
+  // - mouseenter: start a 160ms debounce timer, then fetch translation
+  // - mousemove: reposition tooltip to follow the cursor
+  // - mouseleave: schedule tooltip hide (with grace period for tooltip entry)
   node.addEventListener("mouseenter", (e) => {
     if (hoverTimer) clearTimeout(hoverTimer);
     if (hideTimer) {
@@ -1166,6 +1238,11 @@ function attachWordHover(node, word, context) {
 }
 
 function appendInteractiveText(container, text, segmentIndex = -1) {
+  // Render segment text as clickable, hoverable word spans.
+  // Two paths:
+  //   1. Word-level timing available (Whisper JSON): render from currentWords
+  //      with data-word-index for word-level highlighting during playback.
+  //   2. Fallback (SRT or no timing): split on whitespace and render plain spans.
   const range = (segmentIndex >= 0 && segmentWordRanges[segmentIndex]) ? segmentWordRanges[segmentIndex] : null;
 
   if (range && range.start <= range.end && currentWords.length > 0) {
@@ -1224,6 +1301,8 @@ function appendInteractiveText(container, text, segmentIndex = -1) {
 }
 
 function appendSegmentCaption(container, translation, className) {
+  // Create and append a translation caption div below a segment's German text.
+  // Hidden by default if no translation text is available yet.
   const captionEl = document.createElement("div");
   captionEl.className = className;
   setCaptionText(captionEl, translation);
@@ -1232,12 +1311,16 @@ function appendSegmentCaption(container, translation, className) {
 }
 
 function setCaptionText(captionEl, translation) {
+  // Update a caption element's text and visibility.  Empty translations hide
+  // the element to avoid blank vertical space in the transcript.
   const text = (translation || "").trim();
   captionEl.textContent = text;
   captionEl.hidden = !text;
 }
 
 function ensureCaptionElement(rowEl, className) {
+  // Find or create a caption sub-element within a segment row.
+  // Used by updateRenderedSegmentCaption to inject translations after initial render.
   if (!rowEl) return null;
 
   let captionEl = rowEl.querySelector(`.${className}`);
@@ -1250,6 +1333,8 @@ function ensureCaptionElement(rowEl, className) {
 }
 
 function updateRenderedSegmentCaption(index, translation) {
+  // Push a newly-fetched translation into both the normal and fullscreen transcript
+  // views without re-rendering the entire transcript DOM.
   const regularRow = transcriptViewerEl.querySelector(`.segment[data-index='${index}']`);
   const regularCaption = ensureCaptionElement(regularRow, "segment-caption");
   if (regularCaption) setCaptionText(regularCaption, translation);
@@ -1267,6 +1352,10 @@ function updateEpisodeListSelection() {
 }
 
 async function loadSegmentTranslation(index, loadToken) {
+  // Fetch and cache the English translation for a single segment.
+  // Skips if the segment already has a translation (from the server or a previous fetch).
+  // The loadToken check prevents stale fetches from a previous episode from
+  // overwriting the current episode's transcript.
   if (loadToken !== activeEpisodeLoadToken) return;
 
   const segment = currentSegments[index];
@@ -1291,6 +1380,8 @@ async function loadSegmentTranslation(index, loadToken) {
 }
 
 function ensureActiveSegmentTranslation() {
+  // Triggered on each timeupdate — kicks off lazy translation loading
+  // for segments near the current playback position.
   if (activeSegmentIndex < 0) return;
   void lazyTranslateAround(activeSegmentIndex, activeEpisodeLoadToken);
 }
@@ -1302,8 +1393,13 @@ async function hydrateSegmentTranslations(loadToken) {
 }
 
 let _translatingAroundCenter = -1;
+// Re-entry guard: prevents duplicate translation requests when timeupdate
+// fires multiple times while still translating the same segment window.
 
 async function lazyTranslateAround(center, loadToken) {
+  // Translate ±3 segments around the currently playing segment, starting
+  // from the center and expanding outward.  Sequential await prevents
+  // flooding the single-threaded Flask server with parallel requests.
   if (loadToken !== activeEpisodeLoadToken || !currentSegments.length) return;
   if (center < 0) center = 0;
   // Avoid re-entering for the same center — timeupdate fires frequently.
@@ -1331,6 +1427,8 @@ async function lazyTranslateAround(center, loadToken) {
 }
 
 function renderEpisodeList() {
+  // Render the sidebar episode list.  On receiver, episode clicks go through
+  // receiverEstablishMediaSession (Cast framework load), not loadEpisode directly.
   episodeListEl.innerHTML = "";
 
   if (filteredEpisodes.length === 0) {
@@ -1357,10 +1455,15 @@ function renderEpisodeList() {
     item.appendChild(meta);
     item.addEventListener("click", async () => {
       castLog("INFO", "episode item clicked:", ep.id);
-      await loadEpisode(ep.id);
       if (receiverMode) {
+        // Let the Cast framework load media via playerManager.load() — the
+        // LOAD interceptor will call loadEpisode(id, {skipAudioSrc: true})
+        // for the transcript.  Calling loadEpisode directly would set
+        // audioEl.src and conflict with the framework's own load.
         receiverEstablishMediaSession(ep.id);
         notifySenderEpisodeChanged(ep.id);
+      } else {
+        await loadEpisode(ep.id);
       }
     });
     episodeListEl.appendChild(item);
@@ -1435,14 +1538,17 @@ async function selectEpisodeFromFsPicker() {
   if (!ep) return;
   castLog("INFO", "selectEpisodeFromFsPicker:", ep.id, "index:", fsEpisodePickerIndex);
   closeFsEpisodePicker();
-  await loadEpisode(ep.id);
   if (receiverMode) {
     receiverEstablishMediaSession(ep.id);
     notifySenderEpisodeChanged(ep.id);
+  } else {
+    await loadEpisode(ep.id);
   }
 }
 
 function renderSegments(segments) {
+  // Render the main (non-fullscreen) transcript view as a list of clickable
+  // segment rows, each containing interactive word spans and a caption div.
   transcriptViewerEl.innerHTML = "";
 
   if (!segments || segments.length === 0) {
@@ -1493,6 +1599,9 @@ function renderPlainText(text) {
 }
 
 function renderWords(words) {
+  // Alternative rendering mode: word-level view (no segment grouping).
+  // Groups words by their context string (which maps to the parent segment text)
+  // so the display still appears as rows rather than one continuous blob.
   transcriptViewerEl.innerHTML = "";
   if (!words || words.length === 0) {
     const empty = document.createElement("div");
@@ -1554,6 +1663,9 @@ function renderWords(words) {
 }
 
 function updateActiveSegment() {
+  // Called on every timeupdate (~4Hz).  Finds which segment contains the
+  // current audio time and highlights it, scrolling it into view.
+  // Also triggers lazy translation loading for nearby segments.
   if (!currentSegments.length) return;
 
   const t = audioEl.currentTime;
@@ -1621,12 +1733,24 @@ function updateActiveWord() {
      }
      if (activeEl) {
        activeEl.classList.add("active");
-       activeEl.scrollIntoView({ block: "center", behavior: "smooth" });
+      activeEl.scrollIntoView({ block: "center", behavior: "smooth" });
      }
    }
 }
 
 async function loadEpisode(id, { skipCastLoad = false, skipAudioSrc = false } = {}) {
+  // Core episode loading function.  Fetches transcript data and sets up audio.
+  //
+  // Options:
+  //   skipCastLoad: true when called from receiver's Cast message (don't echo
+  //                 a LOAD back to receiver) or from the sender's namespace
+  //                 listener (receiver already has the episode).
+  //   skipAudioSrc: true when called from the LOAD interceptor on the receiver —
+  //                 the Cast framework sets audioEl.src via setMediaElement,
+  //                 so we must not overwrite it here.
+  //
+  // Uses a monotonic loadToken to cancel stale calls — if the user rapidly
+  // switches episodes, only the latest loadEpisode completes.
   const loadToken = ++activeEpisodeLoadToken;
   castLog("INFO", "loadEpisode:", id, "token:", loadToken,
     "skipCastLoad:", skipCastLoad, "skipAudioSrc:", skipAudioSrc);
@@ -1742,6 +1866,8 @@ function applyFilter() {
 // ── Fullscreen ──────────────────────────────────────────────────────────────
 
 function appendFsInteractiveText(container, text, segmentIndex = -1) {
+  // Same as appendInteractiveText but uses data-fs-word-index attributes
+  // so fullscreen word highlighting doesn't collide with normal view selectors.
   const range = (segmentIndex >= 0 && segmentWordRanges[segmentIndex]) ? segmentWordRanges[segmentIndex] : null;
 
   if (range && range.start <= range.end && currentWords.length > 0) {
@@ -1862,6 +1988,8 @@ function _hideFsOverlay() {
 }
 
 function updateFsCaptionVisibility() {
+  // Toggle "fs-paused" class on the fullscreen overlay — used by CSS to show/hide
+  // translation captions (visible when paused, hidden during playback to reduce clutter).
   fsOverlayEl.classList.toggle("fs-paused", isFullscreen && audioEl.paused);
   if (receiverToggleBtnEl) {
     receiverToggleBtnEl.textContent = audioEl.paused ? "Play" : "Pause";
@@ -1877,6 +2005,8 @@ function seekToSegment(index) {
 }
 
 function jumpToNextSegment() {
+  // Find the first segment that starts after the current time (+50ms lookahead
+  // to avoid re-selecting the current segment if we're right at its start).
   if (!currentSegments.length) return;
   const t = audioEl.currentTime + 0.05;
   let nextIdx = currentSegments.findIndex((seg) => seg.start > t);
@@ -1886,6 +2016,9 @@ function jumpToNextSegment() {
 }
 
 function jumpToPreviousSegment() {
+  // Find the last segment that starts at or before (currentTime - 350ms).
+  // The 350ms offset means a quick double-tap goes to the segment before the
+  // current one, while a single tap near the start re-starts the current segment.
   if (!currentSegments.length) return;
   const t = Math.max(0, audioEl.currentTime - 0.35);
   let prevIdx = 0;
@@ -1901,6 +2034,8 @@ function jumpToPreviousSegment() {
 }
 
 function togglePlayPause() {
+  // Toggle local audio playback.  When casting, also toggle the remote via
+  // remotePlayerController.playOrPause() to keep sender and receiver in sync.
   castLog("INFO", "togglePlayPause — paused:", audioEl.paused,
     "src:", audioEl.src ? "set" : "empty", "readyState:", audioEl.readyState);
   if (audioEl.paused) {
@@ -1978,6 +2113,9 @@ function updateFsProgress() {
 }
 
 function updateFsActiveSegment() {
+  // Fullscreen equivalent of updateActiveSegment.
+  // Returns early (instead of setting -1) when no segment matches — this keeps
+  // the previous segment highlighted through inter-segment gaps, avoiding flicker.
   if (!isFullscreen || !currentSegments.length) return;
   const t = audioEl.currentTime;
   let nextIndex = -1;
@@ -1996,6 +2134,9 @@ function updateFsActiveSegment() {
 }
 
 function updateFsActiveWord() {
+  // Fullscreen equivalent of updateActiveWord.
+  // Only touches word-level .active class — segment-level highlighting is
+  // managed exclusively by updateFsActiveSegment to avoid conflicts.
    if (!isFullscreen || !currentWords || !Array.isArray(currentWords) || currentWords.length === 0) return;
 
    const t = audioEl.currentTime;
@@ -2034,7 +2175,9 @@ function updateFsActiveWord() {
    }
 }
 
-// Progress bar scrubbing
+// Progress bar click-to-seek: calculate time from click position relative
+// to the progress bar track width.  autoPlay=false so clicking the bar
+// while paused doesn't accidentally start playback.
 fsProgressTrackEl.addEventListener("click", (e) => {
   if (!audioEl.duration) return;
   const rect = fsProgressTrackEl.getBoundingClientRect();
@@ -2085,160 +2228,6 @@ if (receiverToggleBtnEl) {
       _toggleLongPressTimer = null;
     }
     _toggleDidLongPress = false;
-  });
-}
-
-document.addEventListener("fullscreenchange", () => {
-  if (isFullscreen) {
-    fsOverlayEl.classList.remove("hidden");
-  }
-});
-
-// ────────────────────────────────────────────────────────────────────────────
-
-// ── Translation toggle ──────────────────────────────────────────────────────
-
-function updateTranslationVisibility() {
-  if (translationsVisible) {
-    transcriptViewerEl.classList.remove("hide-translations");
-    translationToggleBtnEl.classList.add("active");
-  } else {
-    transcriptViewerEl.classList.add("hide-translations");
-    translationToggleBtnEl.classList.remove("active");
-  }
-}
-
-translationToggleBtnEl.addEventListener("click", () => {
-  translationsVisible = !translationsVisible;
-  updateTranslationVisibility();
-});
-
-// ────────────────────────────────────────────────────────────────────────────
-
-async function init() {
-  castLog("INFO", "init() starting");
-  try {
-    if (receiverMode) {
-      castLog("INFO", "entering receiver mode");
-      enterFullscreen();
-
-      // Set up Cast receiver for real Chromecast (auth token arrives via
-      // namespace → loadEpisodesForReceiver).  In a regular browser the SDK
-      // won't be found and initCastReceiver retries harmlessly.
-      initCastReceiver();
-
-      // Also try to load episodes immediately using cookie auth — this works
-      // when testing in a browser.  On actual Chromecast (no cookies) this
-      // will 401, which is fine; the Cast auth token flow handles it.
-      if (!episodes.length) {
-        castLog("INFO", "attempting eager episode load (cookie auth)");
-        try {
-          await loadRuntimeConfig();
-          episodes = await fetchJson("/api/episodes");
-          filteredEpisodes = episodes.slice();
-          castLog("OK", "eager load succeeded:", episodes.length, "episodes");
-          renderEpisodeList();
-        } catch (err) {
-          castLog("INFO", "eager load failed (expected on Chromecast):", err.message);
-        }
-      }
-
-      if (!currentEpisodeId) {
-        openFsEpisodePicker();
-      }
-      return;
-    }
-
-    // Sender mode: normal auth + data load flow.
-    await ensureAuthenticatedSession();
-    castLog("INFO", "auth session ensured");
-    await loadRuntimeConfig();
-    episodes = await fetchJson("/api/episodes");
-    filteredEpisodes = episodes.slice();
-    statusTextEl.textContent = `${episodes.length} episode(s) found.`;
-    castLog("INFO", "episodes loaded:", episodes.length);
-    renderEpisodeList();
-
-    castLog("INFO", "entering sender mode");
-    initCastSender();
-  } catch (err) {
-    castLog("ERROR", "init failed:", err.message);
-    statusTextEl.textContent = `Error: ${err.message}`;
-  }
-}
-
-audioEl.addEventListener("timeupdate", () => {
-  updateActiveSegment();
-  updateActiveWord();
-  updateFsProgress();
-  updateFsActiveSegment();
-  updateFsActiveWord();
-});
-audioEl.addEventListener("seeked", () => {
-  castLog("INFO", "audioEl seeked — time:", audioEl.currentTime.toFixed(2),
-    "paused:", audioEl.paused, "casting:", _isCasting());
-  if (isFullscreen) {
-    fsTranscriptEl.querySelectorAll(".fs-segment.active").forEach(el => el.classList.remove("active"));
-    fsTranscriptEl.querySelectorAll("[data-fs-word-index].active, .fs-word.active").forEach(el => el.classList.remove("active"));
-  }
-  transcriptViewerEl.querySelectorAll(".segment.active").forEach(el => el.classList.remove("active"));
-  transcriptViewerEl.querySelectorAll("[data-word-index].active, .word.active").forEach(el => el.classList.remove("active"));
-
-  fsActiveSegmentIndex = -1;
-  fsActiveWordIndex = -1;
-  activeSegmentIndex = -1;
-  activeWordIndex = -1;
-  updateActiveSegment();
-  updateActiveWord();
-  updateFsActiveSegment();
-  updateFsActiveWord();
-});
-audioEl.addEventListener("play", () => {
-  castLog("INFO", "audioEl play — time:", audioEl.currentTime.toFixed(2),
-    "muted:", audioEl.muted, "casting:", _isCasting());
-  updateFsCaptionVisibility();
-});
-audioEl.addEventListener("pause", () => {
-  castLog("INFO", "audioEl pause — time:", audioEl.currentTime.toFixed(2),
-    "muted:", audioEl.muted, "casting:", _isCasting());
-  updateFsCaptionVisibility();
-  ensureActiveSegmentTranslation();
-});
-audioEl.addEventListener("error", () => {
-  const e = audioEl.error;
-  castLog("ERROR", "audioEl error — code:", e ? e.code : "?", "message:", e ? e.message : "?",
-    "src:", audioEl.src ? audioEl.src.substring(0, 80) : "empty");
-});
-audioEl.addEventListener("loadstart", () => {
-  castLog("INFO", "audioEl loadstart — src:", audioEl.src ? audioEl.src.substring(0, 80) : "empty");
-});
-audioEl.addEventListener("canplay", () => {
-  castLog("INFO", "audioEl canplay — duration:", audioEl.duration ? audioEl.duration.toFixed(1) : "?",
-    "time:", audioEl.currentTime.toFixed(2));
-});
-audioEl.addEventListener("waiting", () => {
-  castLog("WARN", "audioEl waiting (buffering) — time:", audioEl.currentTime.toFixed(2));
-});
-audioEl.addEventListener("stalled", () => {
-  castLog("WARN", "audioEl stalled — time:", audioEl.currentTime.toFixed(2),
-    "networkState:", audioEl.networkState);
-});
-
-searchInputEl.addEventListener("input", applyFilter);
-window.addEventListener("scroll", hideTooltip, true);
-
-if (receiverEpisodesBtnEl) {
-  receiverEpisodesBtnEl.addEventListener("click", () => {
-    if (isFsEpisodePickerOpen) {
-      if (currentEpisodeId) closeFsEpisodePicker();
-    } else {
-      openFsEpisodePicker();
-    }
-  });
-}
-if (fsEpisodePickerCloseBtnEl) {
-  fsEpisodePickerCloseBtnEl.addEventListener("click", () => {
-    if (currentEpisodeId) closeFsEpisodePicker();
   });
 }
 
@@ -2399,6 +2388,11 @@ document.addEventListener("keydown", async (e) => {
 
 
 document.addEventListener("keyup", (e) => {
+  // Complete the long-press detection started in keydown.
+  // If released before the 1.6s threshold, treat as a short press:
+  //   - Picker open → select episode
+  //   - No episode → open picker
+  //   - Otherwise → toggle play/pause
   if (!isFullscreen) return;
   const isConfirmKey = e.key === "Enter" || e.key === " " || e.code === "Enter" || e.code === "Space";
   if (isConfirmKey) {
@@ -2424,4 +2418,5 @@ document.addEventListener("keyup", (e) => {
   }
 }, /* capture */ true);
 
+// Kick off the application.
 init();
