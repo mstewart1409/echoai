@@ -176,6 +176,7 @@ let receiverAuthToken = null;
 let remotePlayer = null;
 let remotePlayerController = null;
 let castTimeSyncInterval = null;
+let castTokenRefreshInterval = null;
 
 /**
  * Whether we have an active Cast session.  Uses `castSession` (set reliably
@@ -495,6 +496,9 @@ function setupCastSync(session) {
       if (remotePlayer.isPaused) {
         audioEl.pause();
       } else {
+        // Snap local time to remote BEFORE resuming so the transcript doesn't
+        // briefly show the stale paused position.
+        audioEl.currentTime = remotePlayer.currentTime;
         _ensureLocalMutedPlayback();
       }
     }
@@ -504,7 +508,7 @@ function setupCastSync(session) {
   remotePlayerController.addEventListener(
     cast.framework.RemotePlayerEventType.CURRENT_TIME_CHANGED,
     () => {
-      if (Math.abs(audioEl.currentTime - remotePlayer.currentTime) > 1) {
+      if (remotePlayer.duration > 0 && Math.abs(audioEl.currentTime - remotePlayer.currentTime) > 1) {
         audioEl.currentTime = remotePlayer.currentTime;
       }
     }
@@ -522,7 +526,7 @@ function setupCastSync(session) {
       _ensureLocalMutedPlayback();
     }
     const drift = Math.abs(audioEl.currentTime - remotePlayer.currentTime);
-    if (drift > 1) {
+    if (drift > 1 && remotePlayer.duration > 0) {
       castLog("INFO", "drift correction:", drift.toFixed(1), "s");
       audioEl.currentTime = remotePlayer.currentTime;
     }
@@ -542,7 +546,9 @@ function setupCastSync(session) {
           return;
         }
         castLog("INFO", "receiver changed episode to:", msg.episodeId);
-        loadEpisode(msg.episodeId, { skipCastLoad: true });
+        // Load episode locally AND on the cast session so the RemotePlayer
+        // tracks the media (needed for play/pause and drift correction).
+        loadEpisode(msg.episodeId);
       }
     } catch (err) {
       castLog("ERROR", "sender Cast message parse error:", err.message);
@@ -557,6 +563,10 @@ function teardownCastSync() {
   if (castTimeSyncInterval) {
     clearInterval(castTimeSyncInterval);
     castTimeSyncInterval = null;
+  }
+  if (castTokenRefreshInterval) {
+    clearInterval(castTokenRefreshInterval);
+    castTokenRefreshInterval = null;
   }
   remotePlayer = null;
   remotePlayerController = null;
@@ -631,18 +641,17 @@ function initCastSender() {
     });
   }
 
-  // Register callback for when Cast SDK loads.
-  window.__onGCastApiAvailable = function (isAvailable) {
-    castLog("INFO", "__onGCastApiAvailable fired — isAvailable:", isAvailable);
-    if (isAvailable) onCastApiReady();
-  };
-
   // Chrome's built-in Cast extension may have already loaded the framework.
   // Only inject cast_sender.js manually if it hasn't.
   if (window.cast && window.cast.framework) {
     castLog("INFO", "Cast framework already present (Chrome extension) — using it directly");
     onCastApiReady();
   } else {
+    // Register callback for when Cast SDK loads — only needed when loading dynamically.
+    window.__onGCastApiAvailable = function (isAvailable) {
+      castLog("INFO", "__onGCastApiAvailable fired — isAvailable:", isAvailable);
+      if (isAvailable) onCastApiReady();
+    };
     castLog("INFO", "Cast framework not present — loading cast_sender.js dynamically");
     const script = document.createElement("script");
     script.src = "https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1";
@@ -701,9 +710,14 @@ function initCastSender() {
 }
 
 async function sendAuthToReceiver(session) {
-  castLog("INFO", "sendAuthToReceiver: waiting 1.5s for receiver startup...");
-  await new Promise((r) => setTimeout(r, 1500));
+  castLog("INFO", "sendAuthToReceiver: waiting 500ms for receiver startup...");
+  await new Promise((r) => setTimeout(r, 500));
+  const ttl = await _mintAndSendCastToken(session);
+  _startCastTokenRefresh(session, ttl);
+}
 
+/** Mint a fresh cast token and send it to the receiver. */
+async function _mintAndSendCastToken(session) {
   try {
     castLog("INFO", "requesting auth token for receiver (episode_id=_auth)");
     const response = await fetch("/api/cast/session", {
@@ -713,19 +727,35 @@ async function sendAuthToReceiver(session) {
     });
     if (!response.ok) {
       castLog("ERROR", "auth token request failed:", response.status);
-      return;
+      return 0;
     }
     const data = await response.json();
     if (data.token) {
       castLog("INFO", "sending auth token to receiver via namespace:", CAST_NAMESPACE);
       session.sendMessage(CAST_NAMESPACE, JSON.stringify({ type: "auth", token: data.token }));
-      castLog("OK", "auth token sent to receiver");
+      castLog("OK", "auth token sent to receiver, ttl:", data.token_ttl_seconds || "unknown");
+      return data.token_ttl_seconds || 300;
     } else {
       castLog("WARN", "auth token response had no token");
     }
   } catch (err) {
-    castLog("ERROR", "sendAuthToReceiver error:", err.message || err);
+    castLog("ERROR", "_mintAndSendCastToken error:", err.message || err);
   }
+  return 0;
+}
+
+/** Periodically refresh the cast token before it expires. */
+function _startCastTokenRefresh(session, ttlSeconds) {
+  if (castTokenRefreshInterval) clearInterval(castTokenRefreshInterval);
+  // Refresh at 80% of the TTL (default 300s → every 240s).
+  const effectiveTtl = (ttlSeconds && ttlSeconds > 30) ? ttlSeconds : 300;
+  const refreshMs = (effectiveTtl * 0.8) * 1000;
+  castLog("INFO", "cast token refresh scheduled every", (refreshMs / 1000).toFixed(0), "s");
+  castTokenRefreshInterval = setInterval(async () => {
+    if (!_isCasting()) return;
+    castLog("INFO", "periodic cast token refresh");
+    await _mintAndSendCastToken(session);
+  }, refreshMs);
 }
 
 // Map Cast DetailedErrorCode numbers to readable names for debug logging.
@@ -843,7 +873,7 @@ function initCastReceiver() {
   // controls overlay on Google TV / touch-enabled Cast devices.
   options.touchScreenOptimizedApp = true;
   options.playbackConfig = new cast.framework.PlaybackConfig();
-  options.playbackConfig.autoResumeDuration = 5;
+  options.playbackConfig.autoResumeDuration = 0;
   context.start(options);
   castLog("OK", "CastReceiverContext started");
 
@@ -1225,7 +1255,8 @@ async function lazyTranslateAround(center, loadToken) {
 
   for (const index of indices) {
     if (loadToken !== activeEpisodeLoadToken) return;
-    await loadSegmentTranslation(index, loadToken);
+    // Fire translations in parallel — don't await sequentially.
+    loadSegmentTranslation(index, loadToken);
   }
 }
 

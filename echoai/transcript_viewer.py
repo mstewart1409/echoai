@@ -562,7 +562,7 @@ def translate_text_de_to_en(text: str) -> str:
     }
 
     try:
-        resp = requests.get(url, params=params, timeout=12)
+        resp = requests.get(url, params=params, timeout=6)
         resp.raise_for_status()
         data = resp.json()
     except Exception:
@@ -821,7 +821,9 @@ def api_cast_session():
 
     token, expires_at = _mint_cast_token(episode_id)
     logger.info('cast/session: token minted for episode=%s expires_at=%d', episode_id, expires_at)
-    return jsonify({'token': token, 'expires_at': expires_at})
+    return jsonify(
+        {'token': token, 'expires_at': expires_at, 'token_ttl_seconds': CAST_TOKEN_TTL_SECONDS}
+    )
 
 
 @app.post('/api/cast/validate')
