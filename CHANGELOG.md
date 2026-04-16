@@ -1,3 +1,9 @@
+## 0.11.0 (2026-04-16)
+
+### Feat
+
+- enhance app.js with detailed comments and refactor cast debug panel logic
+
 ## 0.10.1 (2026-04-16)
 
 ### Fix

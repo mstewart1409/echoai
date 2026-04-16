@@ -8,7 +8,7 @@ required-markers = [
 ]
 
 [options]
-exclude-newer = "2026-04-15T17:15:09.686773526Z"
+exclude-newer = "2026-04-15T17:48:03.780541252Z"
 exclude-newer-span = "P1D"
 
 [[package]]
@@ -393,7 +393,7 @@ wheels = [
 
 [[package]]
 name = "echoai"
-version = "0.10.1"
+version = "0.11.0"
 source = { editable = "." }
 dependencies = [
     { name = "flask" },
