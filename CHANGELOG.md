@@ -1,3 +1,9 @@
+## 0.10.0 (2026-04-16)
+
+### Feat
+
+- enhance receiver media session management with improved episode loading and drift correction
+
 ## 0.9.0 (2026-04-16)
 
 ### Feat
