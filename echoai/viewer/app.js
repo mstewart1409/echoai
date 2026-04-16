@@ -23,7 +23,7 @@ const fsEpisodePickerListEl = document.getElementById("fsEpisodePickerList");
 const fsEpisodePickerCloseBtnEl = document.getElementById("fsEpisodePickerCloseBtn");
 const urlParams = new URLSearchParams(window.location.search);
 const receiverMode = urlParams.get("mode") === "receiver" || urlParams.get("receiver") === "1";
-const castDebugEnabled = urlParams.get("castDebug") === "1;
+const castDebugEnabled = urlParams.get("castDebug") === "1";
 
 // ── Cast Debug Logger ────────────────────────────────────────────────────────
 const CAST_LOG_MAX = 200;
