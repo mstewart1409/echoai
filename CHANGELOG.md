@@ -1,3 +1,9 @@
+## 0.9.0 (2026-04-16)
+
+### Feat
+
+- implement cast token minting and refresh mechanism for improved session management
+
 ## 0.8.0 (2026-04-12)
 
 ### Feat
