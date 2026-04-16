@@ -1,3 +1,9 @@
+## 0.10.1 (2026-04-16)
+
+### Fix
+
+- correct syntax error in castDebugEnabled assignment
+
 ## 0.10.0 (2026-04-16)
 
 ### Feat
