@@ -1,3 +1,9 @@
+## 0.12.0 (2026-04-16)
+
+### Feat
+
+- add on-screen debug panel for Cast logging with enhanced controls
+
 ## 0.11.0 (2026-04-16)
 
 ### Feat
