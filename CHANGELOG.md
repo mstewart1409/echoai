@@ -1,3 +1,9 @@
+## 0.13.0 (2026-08-07)
+
+### Feat
+
+- add smoke tests for viewer app and enhance deployment documentation
+
 ## 0.12.0 (2026-04-16)
 
 ### Feat
