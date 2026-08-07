@@ -25,6 +25,7 @@ venv/
 .vscode/
 *.swp
 *.swo
+.codegraph
 
 # OS
 Thumbs.db

@@ -138,29 +138,6 @@ body {
   background: #fff7ed;
   outline: 1px solid #fb923c;
 }
-.words-container {
-  padding: 12px;
-  line-height: 2;
-  font-size: 18px;
-  font-weight: 500;
-}
-.word {
-  padding: 2px 4px;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: background 0.1s;
-}
-.word:hover {
-  background: #fef08a;
-}
-.word.active {
-  background: #fbbf24;
-  font-weight: 700;
-}
-.word.low-confidence {
-  opacity: 0.45;
-  text-decoration: underline dotted #9ca3af;
-}
 .translatable-word {
   cursor: help;
   border-radius: 4px;
@@ -172,6 +149,13 @@ body {
 }
 .translatable-word:hover {
   background: #eaf2ff;
+}
+/* Low-confidence Whisper tokens. The class is set on .translatable-word spans;
+   it was previously only styled as `.word.low-confidence`, a selector that
+   never matched anything, so the cue never rendered. */
+.translatable-word.low-confidence {
+  opacity: 0.55;
+  text-decoration: underline dotted #9ca3af;
 }
 [data-word-index].active {
    background: #fbbf24;
@@ -376,27 +360,6 @@ body {
   font-style: italic;
   text-align: center;
   margin-top: 30vh;
-}
-
-/* FS word-level highlighting */
-.fs-word {
-   cursor: pointer;
-   border-radius: 4px;
-   padding: 2px 3px;
-   transition: background 0.1s;
-}
-.fs-segment.active .fs-word {
-   background: rgba(251, 191, 36, 0.25);
-}
-.fs-word.active {
-   background: #fbbf24;
-   color: #000;
-   border-radius: 4px;
-}
-.fs-word:hover {
-   background: rgba(251, 191, 36, 0.92);
-   color: #111827;
-   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18);
 }
 
 /* Receiver mode: show only fullscreen overlay UI */

@@ -11,6 +11,7 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 
 import requests
 import spacy
@@ -25,49 +26,48 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BASE_DIR = PROJECT_ROOT
 load_dotenv(PROJECT_ROOT / '.env')
 
-BASE_DIR = Path(os.getenv('TRANSCRIPT_VIEWER_BASE_DIR', str(DEFAULT_BASE_DIR))).resolve()
+
+def env_int(name: str, default: int) -> int:
+    """Read an integer env var, falling back to the default on anything unusable."""
+    try:
+        return int(os.getenv(name, ''))
+    except ValueError:
+        return default
+
+
 DOWNLOADS_DIR = Path(
-    os.getenv('TRANSCRIPT_VIEWER_DOWNLOADS_DIR', str(BASE_DIR / 'downloads'))
+    os.getenv('TRANSCRIPT_VIEWER_DOWNLOADS_DIR', str(DEFAULT_BASE_DIR / 'downloads'))
 ).resolve()
 TRANSCRIPTS_DIR = Path(
-    os.getenv('TRANSCRIPT_VIEWER_TRANSCRIPTS_DIR', str(BASE_DIR / 'transcripts'))
+    os.getenv('TRANSCRIPT_VIEWER_TRANSCRIPTS_DIR', str(DEFAULT_BASE_DIR / 'transcripts'))
 ).resolve()
 VIEWER_DIR = Path(
-    os.getenv('TRANSCRIPT_VIEWER_STATIC_DIR', str(BASE_DIR / 'echoai' / 'viewer'))
+    os.getenv('TRANSCRIPT_VIEWER_STATIC_DIR', str(DEFAULT_BASE_DIR / 'echoai' / 'viewer'))
 ).resolve()
 SPACY_MODEL = os.getenv('TRANSCRIPT_VIEWER_SPACY_MODEL', 'de_core_news_sm')
-CAST_RECEIVER_APP_ID = os.getenv('TRANSCRIPT_VIEWER_CAST_RECEIVER_APP_ID', 'CC1AD845')
+CAST_RECEIVER_APP_ID = os.getenv('TRANSCRIPT_VIEWER_CAST_RECEIVER_APP_ID', '')
 AUTH_DISABLED = os.getenv('TRANSCRIPT_VIEWER_AUTH_DISABLED', '').strip().lower() in ('1', 'true')
-AUTH_USERNAME = os.getenv(
-    'TRANSCRIPT_VIEWER_AUTH_USERNAME', os.getenv('TRANSCRIPT_VIEWER_CAST_BASIC_AUTH_USERNAME', '')
-).strip()
-AUTH_PASSWORD = os.getenv(
-    'TRANSCRIPT_VIEWER_AUTH_PASSWORD', os.getenv('TRANSCRIPT_VIEWER_CAST_BASIC_AUTH_PASSWORD', '')
-).strip()
+AUTH_USERNAME = os.getenv('TRANSCRIPT_VIEWER_AUTH_USERNAME', '').strip()
+AUTH_PASSWORD = os.getenv('TRANSCRIPT_VIEWER_AUTH_PASSWORD', '').strip()
 CAST_SIGNING_KEY = os.getenv('TRANSCRIPT_VIEWER_CAST_SIGNING_KEY', AUTH_PASSWORD).strip()
 AUTH_SESSION_SECRET = os.getenv('TRANSCRIPT_VIEWER_AUTH_SESSION_SECRET', CAST_SIGNING_KEY).strip()
-AUTH_SESSION_COOKIE_NAME = (
-    os.getenv('TRANSCRIPT_VIEWER_AUTH_SESSION_COOKIE_NAME', 'tv_session').strip() or 'tv_session'
-)
+AUTH_SESSION_COOKIE_NAME = 'tv_session'
 COOKIE_SECURE = os.getenv('TRANSCRIPT_VIEWER_COOKIE_SECURE', '1').strip().lower() not in (
     '0',
     'false',
 )
-try:
-    CAST_TOKEN_TTL_SECONDS = int(os.getenv('TRANSCRIPT_VIEWER_CAST_TOKEN_TTL_SECONDS', '300'))
-except ValueError:
-    CAST_TOKEN_TTL_SECONDS = 300
-try:
-    AUTH_SESSION_TTL_SECONDS = int(os.getenv('TRANSCRIPT_VIEWER_AUTH_SESSION_TTL_SECONDS', '86400'))
-except ValueError:
-    AUTH_SESSION_TTL_SECONDS = 86400
+# Must comfortably exceed one episode: the media URL handed to the Chromecast
+# embeds this token and is never rewritten, so a seek after expiry would 401.
+# Refresh still runs at 80% TTL for the receiver's API calls.
+CAST_TOKEN_TTL_SECONDS = env_int('TRANSCRIPT_VIEWER_CAST_TOKEN_TTL_SECONDS', 10800)
+AUTH_SESSION_TTL_SECONDS = env_int('TRANSCRIPT_VIEWER_AUTH_SESSION_TTL_SECONDS', 86400)
 CAST_TOKEN_REQUIRED_FOR_MEDIA = (
     os.getenv('TRANSCRIPT_VIEWER_CAST_TOKEN_REQUIRED_FOR_MEDIA', '0') == '1'
 )
 
-# Bounded cache sizes — prevent unbounded memory growth.
-CACHE_MAX_SIZE = int(os.getenv('TRANSCRIPT_VIEWER_CACHE_MAX_SIZE', '10000'))
-AUTH_SESSIONS_MAX = int(os.getenv('TRANSCRIPT_VIEWER_AUTH_SESSIONS_MAX', '1000'))
+# Bounded caches — prevent unbounded memory growth.
+CACHE_MAX_SIZE = 10000
+AUTH_SESSIONS_MAX = 1000
 
 # Maximum input lengths for translation/analysis endpoints.
 TRANSLATE_TEXT_MAX_LEN = 500
@@ -75,6 +75,13 @@ TRANSLATE_WORD_MAX_LEN = 80
 
 # Regex for safe episode IDs — letters, digits, hyphens, underscores only.
 _SAFE_EPISODE_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+# Token scope meaning "any episode" - used for the Cast receiver's session token,
+# which must also cover episodes the receiver picks on-device.
+CAST_SCOPE_ANY = '_auth'
+
+# Routes a cast token must NOT unlock - they require a logged-in session.
+SESSION_ONLY_PATHS = frozenset({'/api/cast/session', '/api/cast/debug'})
 
 logger = logging.getLogger(__name__)
 
@@ -87,86 +94,61 @@ def _validate_episode_id(episode_id: str) -> str | None:
     return episode_id
 
 
-def _fallback_to_local_dir(
+def _pick_dir(
     configured: Path,
     local_default: Path,
     label: str,
-    required_file: str | None = None,
+    usable: Callable[[Path], bool],
 ) -> Path:
-    """Use local project directory when container-only path from .env is missing."""
-    configured_ok = configured.exists()
-    if configured_ok and required_file:
-        configured_ok = (configured / required_file).exists()
+    """Prefer the configured dir, else fall back to the local project dir.
 
-    if configured_ok:
+    `usable` decides what "good enough" means — the directory merely existing,
+    containing index.html, or containing matching content files.
+    """
+    if configured == local_default or usable(configured):
         return configured
-
-    local_ok = local_default.exists()
-    if local_ok and required_file:
-        local_ok = (local_default / required_file).exists()
-
-    if configured != local_default and local_ok:
-        logger.warning('%s path %s not found; falling back to %s', label, configured, local_default)
+    if usable(local_default):
+        logger.warning('%s path %s unusable; falling back to %s', label, configured, local_default)
         return local_default
     return configured
 
 
-def _prefer_local_when_configured_empty(
-    configured: Path,
-    local_default: Path,
-    pattern: str,
-    label: str,
-) -> Path:
-    """Use local project directory when configured directory exists but has no matching files."""
-    if configured == local_default:
-        return configured
-
-    configured_has_files = any(configured.glob(pattern)) if configured.exists() else False
-    local_has_files = any(local_default.glob(pattern)) if local_default.exists() else False
-
-    if not configured_has_files and local_has_files:
-        logger.warning('%s path %s is empty; falling back to %s', label, configured, local_default)
-        return local_default
-    return configured
+def _has_file(name: str) -> Callable[[Path], bool]:
+    return lambda p: (p / name).exists()
 
 
-DOWNLOADS_DIR = _fallback_to_local_dir(DOWNLOADS_DIR, DEFAULT_BASE_DIR / 'downloads', 'Downloads')
-TRANSCRIPTS_DIR = _fallback_to_local_dir(
-    TRANSCRIPTS_DIR, DEFAULT_BASE_DIR / 'transcripts', 'Transcripts'
+def _has_content(pattern: str) -> Callable[[Path], bool]:
+    return lambda p: p.exists() and any(p.glob(pattern))
+
+
+DOWNLOADS_DIR = _pick_dir(
+    DOWNLOADS_DIR, DEFAULT_BASE_DIR / 'downloads', 'Downloads', _has_content('*.mp3')
 )
-VIEWER_DIR = _fallback_to_local_dir(
-    VIEWER_DIR,
-    DEFAULT_BASE_DIR / 'echoai' / 'viewer',
-    'Viewer static',
-    required_file='index.html',
+TRANSCRIPTS_DIR = _pick_dir(
+    TRANSCRIPTS_DIR, DEFAULT_BASE_DIR / 'transcripts', 'Transcripts', _has_content('*.*')
 )
-
-DOWNLOADS_DIR = _prefer_local_when_configured_empty(
-    DOWNLOADS_DIR,
-    DEFAULT_BASE_DIR / 'downloads',
-    '*.mp3',
-    'Downloads',
-)
-TRANSCRIPTS_DIR = _prefer_local_when_configured_empty(
-    TRANSCRIPTS_DIR,
-    DEFAULT_BASE_DIR / 'transcripts',
-    '*.*',
-    'Transcripts',
+VIEWER_DIR = _pick_dir(
+    VIEWER_DIR, DEFAULT_BASE_DIR / 'echoai' / 'viewer', 'Viewer static', _has_file('index.html')
 )
 
 app = Flask(__name__, static_folder=str(VIEWER_DIR), static_url_path='/static')
 
+# Host sources are deliberately scheme-less: the Cast SDK <script> URLs are
+# protocol-relative (Google's documented best practice), so pinning https:// here
+# would block the SDK entirely on an http:// LAN deployment — the exact setup
+# docs/CHROMECAST.md prescribes for Tier-2 testing. A scheme-less host matches
+# the page's own scheme.
 CSP_POLICY = (
     "default-src 'self'; "
     "script-src 'self' 'unsafe-inline' 'unsafe-eval' "
-    'https://www.gstatic.com https://*.gstatic.com '
-    'https://ajax.googleapis.com '
-    'https://static.cloudflareinsights.com; '
+    'www.gstatic.com *.gstatic.com '
+    'ajax.googleapis.com '
+    'static.cloudflareinsights.com; '
     "style-src 'self' 'unsafe-inline'; "
+    # ws://localhost:* is how the CAF receiver reaches the local Cast platform.
     "connect-src 'self' ws://localhost:* wss://localhost:* "
-    'https://translate.googleapis.com '
-    'https://*.google.com https://*.googleapis.com https://*.gstatic.com '
-    'https://*.cloudflareinsights.com; '
+    '*.google.com *.googleapis.com *.gstatic.com '
+    '*.cloudflareinsights.com; '
     "media-src 'self' blob:; "
     "img-src 'self' data: blob:; "
     "font-src 'self';"
@@ -222,10 +204,6 @@ class BoundedCache:
             while len(self._data) > self._max:
                 self._data.popitem(last=False)
 
-    def __contains__(self, key: str) -> bool:
-        with self._lock:
-            return key in self._data
-
     def __len__(self) -> int:
         with self._lock:
             return len(self._data)
@@ -235,10 +213,6 @@ TEXT_TRANSLATION_CACHE: BoundedCache = BoundedCache(CACHE_MAX_SIZE)
 ANALYSIS_CACHE: BoundedCache = BoundedCache(CACHE_MAX_SIZE)
 AUTH_SESSIONS: dict[str, int] = {}
 AUTH_SESSIONS_LOCK = threading.Lock()
-
-
-def _is_cast_basic_auth_enabled() -> bool:
-    return bool(AUTH_USERNAME and AUTH_PASSWORD)
 
 
 def _has_auth_credentials_configured() -> bool:
@@ -252,22 +226,6 @@ def _b64url_encode(raw: bytes) -> str:
 def _b64url_decode(raw: str) -> bytes:
     padding = '=' * (-len(raw) % 4)
     return base64.urlsafe_b64decode((raw + padding).encode('ascii'))
-
-
-def _decode_basic_auth(auth_header: str | None) -> tuple[str, str] | None:
-    if not auth_header or not auth_header.startswith('Basic '):
-        return None
-    token = auth_header[6:].strip()
-    if not token:
-        return None
-    try:
-        decoded = base64.b64decode(token).decode('utf-8')
-    except (binascii.Error, UnicodeDecodeError):
-        return None
-    if ':' not in decoded:
-        return None
-    username, password = decoded.split(':', 1)
-    return username, password
 
 
 def _validate_login_credentials(username: str, password: str) -> bool:
@@ -353,7 +311,7 @@ def _verify_cast_token(token: str) -> dict | None:
     payload_b64, sig_b64 = token.split('.', 1)
     try:
         provided_sig = _b64url_decode(sig_b64)
-    except (ValueError, binascii.Error):
+    except ValueError, binascii.Error:
         return None
     expected_sig = hmac.new(
         CAST_SIGNING_KEY.encode('utf-8'), payload_b64.encode('ascii'), hashlib.sha256
@@ -362,7 +320,7 @@ def _verify_cast_token(token: str) -> dict | None:
         return None
     try:
         payload = json.loads(_b64url_decode(payload_b64).decode('utf-8'))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+    except ValueError, UnicodeDecodeError, json.JSONDecodeError:
         return None
     if not isinstance(payload, dict):
         return None
@@ -408,6 +366,12 @@ def require_authentication():
 
     if _validate_auth_session():
         return None
+
+    # A cast token authenticates the receiver for content only. It must never
+    # authenticate token minting (which would make the TTL meaningless) or
+    # diagnostics. Those require a real logged-in session.
+    if request.path in SESSION_ONLY_PATHS:
+        return _auth_required_response()
 
     token_claims = _verify_cast_token(_extract_cast_token_from_request())
     if token_claims is not None:
@@ -482,16 +446,6 @@ def load_spacy_model() -> spacy.language.Language:
 
 
 nlp = load_spacy_model()
-
-
-def env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
 
 
 def parse_srt_timecode(value: str) -> float:
@@ -749,28 +703,26 @@ def build_follow_on_explanation(word: str, context: str = '') -> dict:
     }
 
 
+def transcript_paths(stem: str) -> dict[str, Path]:
+    """Transcript file candidates for an episode, in preference order."""
+    return {ext: TRANSCRIPTS_DIR / f'{stem}.{ext}' for ext in ('json', 'srt', 'txt')}
+
+
+def transcript_type_for(stem: str) -> str:
+    """Best available transcript format for an episode, or 'none'."""
+    return next((ext for ext, p in transcript_paths(stem).items() if p.exists()), 'none')
+
+
 def build_episode_index() -> list[dict]:
     episodes = []
     for audio_path in sorted(DOWNLOADS_DIR.glob('*.mp3'), key=lambda p: p.name):
         stem = audio_path.stem
-        json_path = TRANSCRIPTS_DIR / f'{stem}.json'
-        srt_path = TRANSCRIPTS_DIR / f'{stem}.srt'
-        txt_path = TRANSCRIPTS_DIR / f'{stem}.txt'
-
-        transcript_type = 'none'
-        if json_path.exists():
-            transcript_type = 'json'
-        elif srt_path.exists():
-            transcript_type = 'srt'
-        elif txt_path.exists():
-            transcript_type = 'txt'
-
         episodes.append(
             {
                 'id': stem,
                 'title': episode_title_from_name(stem),
                 'audio': f'/media/{audio_path.name}',
-                'transcript_type': transcript_type,
+                'transcript_type': transcript_type_for(stem),
             }
         )
 
@@ -793,7 +745,7 @@ def api_config():
     result = {
         'version': __version__,
         'cast_receiver_app_id': CAST_RECEIVER_APP_ID,
-        'auth_required': _is_cast_basic_auth_enabled(),
+        'auth_required': not AUTH_DISABLED and _has_auth_credentials_configured(),
     }
     # Only reveal username hint to authenticated sessions.
     if AUTH_DISABLED or _validate_auth_session():
@@ -807,9 +759,9 @@ def api_cast_session():
     raw_id = str(payload.get('episode_id', '')).strip()
     logger.info('cast/session requested — episode_id=%s remote=%s', raw_id, request.remote_addr)
 
-    # Allow the special _auth token request.
-    if raw_id == '_auth':
-        episode_id = '_auth'
+    # Allow the receiver's any-episode session token request.
+    if raw_id == CAST_SCOPE_ANY:
+        episode_id = CAST_SCOPE_ANY
     else:
         episode_id = _validate_episode_id(raw_id)
     if not episode_id:
@@ -844,7 +796,7 @@ def api_cast_validate():
             'cast/validate: episode mismatch expected=%s got=%s', expected_episode, claims.get('ep')
         )
         return jsonify({'valid': False}), 403
-    logger.info('cast/validate: token valid — claims=%s', claims)
+    logger.info('cast/validate: token valid for episode=%s', claims.get('ep'))
     return jsonify({'valid': True, 'claims': claims})
 
 
@@ -911,9 +863,8 @@ def api_episode(episode_id: str):
     if not audio_path.exists():
         return jsonify({'error': 'episode not found'}), 404
 
-    json_path = TRANSCRIPTS_DIR / f'{safe_id}.json'
-    srt_path = TRANSCRIPTS_DIR / f'{safe_id}.srt'
-    txt_path = TRANSCRIPTS_DIR / f'{safe_id}.txt'
+    paths = transcript_paths(safe_id)
+    json_path, srt_path, txt_path = paths['json'], paths['srt'], paths['txt']
 
     payload = {
         'id': safe_id,
@@ -926,47 +877,69 @@ def api_episode(episode_id: str):
     }
 
     if json_path.exists():
-        raw_segs = json.loads(json_path.read_text(encoding='utf-8', errors='ignore'))
+        try:
+            raw_segs = json.loads(json_path.read_text(encoding='utf-8', errors='ignore'))
+            if not isinstance(raw_segs, list):
+                raise ValueError('transcript json is not a list of segments')
+        except (OSError, ValueError) as exc:
+            logger.warning('Unreadable transcript json for %s: %s', safe_id, type(exc).__name__)
+            raw_segs = []
 
         clean_segs = []
         flat_words = []
         for seg in raw_segs:
-            seg_text = seg.get('text', '').strip()
-            clean_seg = {
-                'start': seg['start'],
-                'end': seg['end'],
-                'text': seg_text,
-                'translation_en': '',
-                'avg_logprob': round(seg.get('avg_logprob', 0), 4),
-                'no_speech_prob': round(seg.get('no_speech_prob', 0), 4),
-            }
-
-            clean_segs.append(clean_seg)
-
-            words_in_seg = seg.get('words', [])
-            for word_data in words_in_seg:
-                flat_words.append(
+            # Per-item isolation: one malformed segment must not lose the episode.
+            try:
+                if not isinstance(seg, dict) or 'start' not in seg or 'end' not in seg:
+                    continue
+                seg_text = str(seg.get('text', '')).strip()
+                segment_index = len(clean_segs)
+                clean_segs.append(
                     {
-                        'word': word_data.get('word', ''),
-                        'start': word_data.get('start', 0),
-                        'end': word_data.get('end', 0),
-                        'probability': word_data.get('probability', 1),
-                        'context': seg_text,
+                        'start': seg['start'],
+                        'end': seg['end'],
+                        'text': seg_text,
+                        'translation_en': '',
+                        'avg_logprob': round(float(seg.get('avg_logprob', 0) or 0), 4),
+                        'no_speech_prob': round(float(seg.get('no_speech_prob', 0) or 0), 4),
                     }
                 )
 
-        payload['segments'] = clean_segs
-        payload['words'] = flat_words
-        payload['text'] = '\n'.join(s['text'] for s in clean_segs)
-        payload['transcript_type'] = 'json'
-        logger.debug(
-            'Extracted %d words from %d segments for %s',
-            len(flat_words),
-            len(raw_segs),
-            safe_id,
-        )
+                for word_data in seg.get('words') or []:
+                    if not isinstance(word_data, dict):
+                        continue
+                    flat_words.append(
+                        {
+                            'word': word_data.get('word', ''),
+                            'start': word_data.get('start', 0),
+                            'end': word_data.get('end', 0),
+                            'probability': word_data.get('probability', 1),
+                            # Explicit owner. The viewer used to re-derive this by
+                            # string-matching 'context' against segment text, which
+                            # mis-assigned every word whenever two segments shared
+                            # the same text.
+                            'segment_index': segment_index,
+                            'context': seg_text,
+                        }
+                    )
+            except (TypeError, ValueError) as exc:
+                logger.warning('Skipping malformed segment in %s: %s', safe_id, type(exc).__name__)
+                continue
 
-    elif srt_path.exists():
+        if clean_segs:
+            payload['segments'] = clean_segs
+            payload['words'] = flat_words
+            payload['text'] = '\n'.join(s['text'] for s in clean_segs)
+            payload['transcript_type'] = 'json'
+            logger.debug(
+                'Extracted %d words from %d segments for %s',
+                len(flat_words),
+                len(raw_segs),
+                safe_id,
+            )
+
+    # Fall through to srt/txt when the json was missing or unusable.
+    if payload['transcript_type'] == 'none' and srt_path.exists():
         payload['transcript_type'] = 'srt'
         segments = parse_srt(srt_path)
         for seg in segments:
@@ -974,7 +947,7 @@ def api_episode(episode_id: str):
         payload['segments'] = segments
         payload['text'] = '\n'.join(seg['text'] for seg in segments)
 
-    elif txt_path.exists():
+    elif payload['transcript_type'] == 'none' and txt_path.exists():
         payload['transcript_type'] = 'txt'
         payload['text'] = txt_path.read_text(encoding='utf-8', errors='ignore')
 
@@ -1063,7 +1036,11 @@ def media(filename: str):
         claims = _verify_cast_token(token)
         if not claims:
             return jsonify({'error': 'invalid cast token'}), 401
-        if claims.get('ep') != Path(filename).stem:
+        # 'ep' is the token scope: a specific episode, or CAST_SCOPE_ANY for the
+        # receiver's own session token (the receiver switches episodes on-device
+        # and cannot mint a per-episode token of its own).
+        scope = claims.get('ep')
+        if scope != CAST_SCOPE_ANY and scope != Path(filename).stem:
             return jsonify({'error': 'cast token episode mismatch'}), 403
     return send_from_directory(DOWNLOADS_DIR, filename, as_attachment=False)
 
@@ -1074,16 +1051,27 @@ def static_files(filename: str):
 
 
 def _validate_secrets() -> None:
-    """Warn at startup if secrets are weak or reused."""
+    """Warn at startup if secrets are weak or reused.
+
+    Thresholds mirror docs/RASPBERRY_PI_DEPLOYMENT.md. The three secrets default
+    to each other when unset, so the reuse checks are what catch a half-filled
+    .env in production.
+    """
     issues = []
-    if AUTH_PASSWORD and len(AUTH_PASSWORD) < 12:
-        issues.append('AUTH_PASSWORD is shorter than 12 characters — use a stronger password')
+    if not AUTH_DISABLED and not _has_auth_credentials_configured():
+        issues.append('auth is enabled but username/password/session secret are not all set')
+    if AUTH_PASSWORD and len(AUTH_PASSWORD) < 16:
+        issues.append('AUTH_PASSWORD is shorter than 16 characters — use a stronger password')
     if AUTH_SESSION_SECRET and AUTH_SESSION_SECRET == AUTH_PASSWORD:
         issues.append('AUTH_SESSION_SECRET equals AUTH_PASSWORD — use an independent secret')
     if CAST_SIGNING_KEY and CAST_SIGNING_KEY == AUTH_PASSWORD:
         issues.append('CAST_SIGNING_KEY equals AUTH_PASSWORD — use an independent signing key')
-    if AUTH_SESSION_SECRET and len(AUTH_SESSION_SECRET) < 32:
-        issues.append('AUTH_SESSION_SECRET is shorter than 32 characters')
+    if AUTH_SESSION_SECRET and AUTH_SESSION_SECRET == CAST_SIGNING_KEY:
+        issues.append('AUTH_SESSION_SECRET equals CAST_SIGNING_KEY — use independent secrets')
+    if AUTH_SESSION_SECRET and len(AUTH_SESSION_SECRET) < 64:
+        issues.append('AUTH_SESSION_SECRET is shorter than 64 characters')
+    if CAST_SIGNING_KEY and len(CAST_SIGNING_KEY) < 64:
+        issues.append('CAST_SIGNING_KEY is shorter than 64 characters')
     for issue in issues:
         logger.warning('SECURITY: %s', issue)
 
@@ -1091,8 +1079,15 @@ def _validate_secrets() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description='Run local transcript web viewer')
     parser.add_argument('--host', default=os.getenv('TRANSCRIPT_VIEWER_HOST', '0.0.0.0'))
-    parser.add_argument('--port', type=int, default=env_int('TRANSCRIPT_VIEWER_PORT', 8765))
+    parser.add_argument('--port', type=int, default=env_int('TRANSCRIPT_VIEWER_PORT', 5000))
     args = parser.parse_args()
+
+    # Without this the module's logger.info/warning calls are dropped, so the
+    # SECURITY: warnings the deployment guide tells you to check never appear.
+    logging.basicConfig(
+        level=os.getenv('TRANSCRIPT_VIEWER_LOG_LEVEL', 'INFO').upper(),
+        format='%(asctime)s %(levelname)s %(name)s %(message)s',
+    )
 
     _validate_secrets()
 

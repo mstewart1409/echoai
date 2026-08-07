@@ -445,18 +445,6 @@ const tooltipExplainBtnEl = document.getElementById("tooltipExplainBtn");
 let tooltipWord = "";
 let tooltipContext = "";
 
-function formatTime(seconds) {
-  // Clamp to non-negative, floor to whole seconds, format as HH:MM:SS or MM:SS.
-  const s = Math.max(0, Math.floor(seconds));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  if (h > 0) {
-    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
-  }
-  return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
-}
-
 async function fetchJson(url) {
   // Attach Cast auth token header when running on receiver (no cookies available).
   const headers = {};
@@ -472,16 +460,23 @@ async function fetchJson(url) {
   return res.json();
 }
 
+// Google's Default Media Receiver. It is Google-hosted and never loads our page,
+// so under it there is no transcript UI and nothing listening on CAST_NAMESPACE.
+// Only useful to prove a device is reachable — see docs/CHROMECAST.md (C-1).
+const DEFAULT_MEDIA_RECEIVER_APP_ID = "CC1AD845";
+
 function getCastReceiverAppId() {
   // Priority: URL query param > localStorage override > server config > default.
-  // The default CC1AD845 is Google's Default Media Receiver (for testing only).
   const fromQuery = new URLSearchParams(window.location.search).get("receiverAppId");
   if (fromQuery) { castLog("INFO", "appId from query:", fromQuery); return fromQuery; }
   const fromStorage = localStorage.getItem("castReceiverAppId");
   if (fromStorage) { castLog("INFO", "appId from localStorage:", fromStorage); return fromStorage; }
   if (runtimeConfig.cast_receiver_app_id) { castLog("INFO", "appId from config:", runtimeConfig.cast_receiver_app_id); return runtimeConfig.cast_receiver_app_id; }
-  castLog("WARN", "using default Cast appId CC1AD845");
-  return "CC1AD845"; // Default Media Receiver fallback
+  castLog("ERROR",
+    "no Cast receiver app id configured — falling back to the Default Media Receiver. " +
+    "Audio may play but the transcript UI and auth channel will NOT work. " +
+    "Register a Custom Web Receiver and set TRANSCRIPT_VIEWER_CAST_RECEIVER_APP_ID.");
+  return DEFAULT_MEDIA_RECEIVER_APP_ID;
 }
 
 async function ensureAuthenticatedSession() {
@@ -738,11 +733,35 @@ function setupCastSync(session) {
     }
   }, 500);
 
+  // The receiver can vanish without a clean SESSION_ENDED (app crash, device
+  // reboot, network drop). Without this the sender keeps a dead castSession,
+  // stays muted, and silently mirrors every seek into the void.
+  remotePlayerController.addEventListener(
+    cast.framework.RemotePlayerEventType.IS_CONNECTED_CHANGED,
+    () => {
+      if (remotePlayer && remotePlayer.isConnected) return;
+      castLog("WARN", "remote disconnected — tearing down cast sync");
+      castSession = null;
+      teardownCastSync();
+      _unmuteSenderForCast();
+      updateCastButtonState();
+    }
+  );
+
   // Listen for custom namespace messages from the receiver (e.g. episode changes).
   session.addMessageListener(CAST_NAMESPACE, (_namespace, messageStr) => {
     try {
       const msg = typeof messageStr === "string" ? JSON.parse(messageStr) : messageStr;
       castLog("INFO", "sender received Cast message — type:", msg.type);
+      // The receiver announces itself once its namespace listener is live.
+      // This closes the race where our initial 500ms-delayed auth push arrived
+      // before the receiver could hear it (previously unrecoverable until the
+      // next refresh tick, i.e. minutes of 401s on the TV).
+      if (msg.type === "ready") {
+        castLog("INFO", "receiver announced ready — re-sending auth token");
+        void _mintAndSendCastToken(session);
+        return;
+      }
       if (msg.type === "episodeChanged" && msg.episodeId) {
         // If the sender already initiated this episode change, the receiver
         // is just echoing it back.  Ignore to avoid cancelling the sender's
@@ -780,6 +799,20 @@ function teardownCastSync() {
   castLog("INFO", "Cast sync torn down");
 }
 
+/**
+ * Attach the sender to a session that already has media loaded (resumed, or
+ * auto-joined before our listeners existed).
+ *
+ * setupCastSync() clears the token refresh timer, so re-issuing the token is
+ * not optional here — without it the receiver's token expires within one TTL
+ * and every one of its requests starts returning 401.
+ */
+function _adoptCastSession(session) {
+  _muteSenderForCast();
+  setupCastSync(session);
+  void sendAuthToReceiver(session);
+}
+
 function initCastSender() {
   if (!castBtnEl) { castLog("WARN", "initCastSender: castBtnEl not found"); return; }
   castLog("INFO", "initCastSender called");
@@ -806,6 +839,17 @@ function initCastSender() {
     castLog("INFO", "Cast SDK ready — existing session:", !!castSession);
     castLog("INFO", "initial castState:", context.getCastState());
     updateCastButtonState();
+
+    // ORIGIN_SCOPED auto-join may have attached a session before our
+    // SESSION_STATE_CHANGED listener existed, so no event will ever arrive for
+    // it. Without this the sender keeps a session it never wired up: local audio
+    // plays unmuted alongside the TV, seeks never reach the receiver
+    // (_isCasting() needs remotePlayerController), and the receiver's token is
+    // never refreshed.
+    if (castSession) {
+      castLog("OK", "adopting pre-existing Cast session");
+      _adoptCastSession(castSession);
+    }
 
     // Track device availability changes — discovery is async and can take seconds.
     context.addEventListener(cast.framework.CastContextEventType.CAST_STATE_CHANGED, (event) => {
@@ -837,8 +881,7 @@ function initCastSender() {
       }
       if (event.sessionState === cast.framework.SessionState.SESSION_RESUMED && castSession) {
         castLog("OK", "Cast session resumed — restoring sync");
-        _muteSenderForCast();
-        setupCastSync(castSession);
+        _adoptCastSession(castSession);
       }
       if (event.sessionState === cast.framework.SessionState.SESSION_ENDED) {
         castLog("INFO", "Cast session ended");
@@ -861,7 +904,7 @@ function initCastSender() {
     };
     castLog("INFO", "Cast framework not present — loading cast_sender.js dynamically");
     const script = document.createElement("script");
-    script.src = "https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1";
+    script.src = "//www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1";
     script.async = true;
     script.addEventListener("load", () => { castLog("INFO", "cast_sender.js loaded"); });
     script.addEventListener("error", (e) => { castLog("ERROR", "cast_sender.js load FAILED", e.message || ""); });
@@ -917,8 +960,9 @@ function initCastSender() {
 }
 
 async function sendAuthToReceiver(session) {
-  // Brief delay lets the receiver finish initializing its Cast context and
-  // namespace listener before we send the token message.
+  // The receiver also asks for a token itself once its namespace listener is up
+  // (the "ready" message), so this initial push is best-effort: if it lands
+  // before the listener exists it is simply lost and the handshake covers us.
   castLog("INFO", "sendAuthToReceiver: waiting 500ms for receiver startup...");
   await new Promise((r) => setTimeout(r, 500));
   const ttl = await _mintAndSendCastToken(session);
@@ -941,7 +985,14 @@ async function _mintAndSendCastToken(session) {
     const data = await response.json();
     if (data.token) {
       castLog("INFO", "sending auth token to receiver via namespace:", CAST_NAMESPACE);
-      session.sendMessage(CAST_NAMESPACE, JSON.stringify({ type: "auth", token: data.token }));
+      // sendMessage returns a Promise — an unhandled rejection here is the
+      // difference between "receiver has no token" and silence.
+      await Promise.resolve(
+        session.sendMessage(CAST_NAMESPACE, JSON.stringify({ type: "auth", token: data.token }))
+      ).catch((err) => {
+        castLog("ERROR", "sendMessage(auth) rejected:", (err && err.message) || err);
+        throw err;
+      });
       castLog("OK", "auth token sent to receiver, ttl:", data.token_ttl_seconds || "unknown");
       return data.token_ttl_seconds || 300;
     } else {
@@ -1035,7 +1086,14 @@ function initCastReceiver() {
       const msg = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
       castLog("INFO", "custom message parsed — type:", msg.type, "hasToken:", !!msg.token);
       if (msg.type === "auth" && msg.token) {
+        const hadToken = !!receiverAuthToken;
         receiverAuthToken = msg.token;
+        if (hadToken) {
+          // Routine refresh (or a duplicate from the ready handshake) — just
+          // swap the token. Re-running the loads here would restart playback.
+          castLog("OK", "auth token refreshed");
+          return;
+        }
         castLog("OK", "auth token stored — loading episodes");
         loadEpisodesForReceiver();
         // If a LOAD already fired before auth arrived, the transcript fetch
@@ -1119,6 +1177,10 @@ function initCastReceiver() {
   });
   context.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, (event) => {
     castLog("OK", "sender connected:", event.senderId || "");
+    // Ask the sender for an auth token now that our namespace listener exists.
+    // Without this the token delivery depends on the sender's fixed 500ms delay
+    // beating receiver startup — a race we lose on cold boots.
+    _announceReceiverReady(event.senderId);
   });
   context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, (event) => {
     castLog("INFO", "sender disconnected:", event.senderId || "", "reason:", event.reason || "");
@@ -1133,6 +1195,24 @@ function initCastReceiver() {
   });
 }
 
+
+/**
+ * Tell the sender this receiver is listening on CAST_NAMESPACE and wants a token.
+ * Sent on SENDER_CONNECTED, i.e. strictly after addCustomMessageListener ran.
+ */
+function _announceReceiverReady(senderId) {
+  if (!receiverMode) return;
+  try {
+    const ctx = window.cast && window.cast.framework &&
+      window.cast.framework.CastReceiverContext &&
+      window.cast.framework.CastReceiverContext.getInstance();
+    if (!ctx) return;
+    ctx.sendCustomMessage(CAST_NAMESPACE, senderId, { type: "ready" });
+    castLog("OK", "sent ready handshake to sender:", senderId || "(broadcast)");
+  } catch (err) {
+    castLog("WARN", "_announceReceiverReady failed:", err.message);
+  }
+}
 
 /**
  * Notify the connected sender that the receiver changed episodes.
@@ -1394,12 +1474,21 @@ function attachWordHover(node, word, context) {
   });
 }
 
-function appendInteractiveText(container, text, segmentIndex = -1) {
-  // Render segment text as clickable, hoverable word spans.
-  // Two paths:
-  //   1. Word-level timing available (Whisper JSON): render from currentWords
-  //      with data-word-index for word-level highlighting during playback.
-  //   2. Fallback (SRT or no timing): split on whitespace and render plain spans.
+/**
+ * Render segment text as clickable, hoverable word spans.
+ *
+ * Two paths:
+ *   1. Word-level timing available (Whisper JSON): render from currentWords
+ *      with an index attribute for word-level highlighting during playback.
+ *   2. Fallback (SRT or no timing): split on whitespace and render plain spans.
+ *
+ * The fullscreen/receiver view uses distinct attribute names so its highlight
+ * selectors never collide with the sender view's.
+ */
+function appendWordSpans(container, text, segmentIndex, fs) {
+  const indexKey = fs ? "fsWordIndex" : "wordIndex";
+  const startAttr = fs ? "data-fs-start" : "data-start";
+  const endAttr = fs ? "data-fs-end" : "data-end";
   const range = (segmentIndex >= 0 && segmentWordRanges[segmentIndex]) ? segmentWordRanges[segmentIndex] : null;
 
   if (range && range.start <= range.end && currentWords.length > 0) {
@@ -1421,9 +1510,9 @@ function appendInteractiveText(container, text, segmentIndex = -1) {
       const wordEl = document.createElement("span");
       wordEl.className = "translatable-word";
       wordEl.textContent = trimmed;
-      wordEl.dataset.wordIndex = String(i);
-      wordEl.setAttribute("data-start", w.start);
-      wordEl.setAttribute("data-end", w.end);
+      wordEl.dataset[indexKey] = String(i);
+      wordEl.setAttribute(startAttr, w.start);
+      wordEl.setAttribute(endAttr, w.end);
 
       const prob = w.probability ?? 1;
       if (prob < 0.6) {
@@ -1455,6 +1544,10 @@ function appendInteractiveText(container, text, segmentIndex = -1) {
       container.appendChild(wordEl);
     }
   }
+}
+
+function appendInteractiveText(container, text, segmentIndex = -1) {
+  appendWordSpans(container, text, segmentIndex, false);
 }
 
 function appendSegmentCaption(container, translation, className) {
@@ -1645,7 +1738,13 @@ function renderFsEpisodePicker() {
     btn.type = "button";
     btn.className = "picker-item" + (i === fsEpisodePickerIndex ? " active" : "");
     btn.dataset.index = String(i);
-    btn.innerHTML = `${ep.title}<span class="picker-meta">${ep.id} · transcript: ${ep.transcript_type}</span>`;
+    // textContent, not innerHTML: ep.id/title come from filenames on disk, which
+    // are never validated against the episode-id charset.
+    btn.textContent = ep.title;
+    const meta = document.createElement("span");
+    meta.className = "picker-meta";
+    meta.textContent = `${ep.id} · transcript: ${ep.transcript_type}`;
+    btn.appendChild(meta);
     btn.addEventListener("click", async () => {
       fsEpisodePickerIndex = i;
       castLog("INFO", "episode picker button clicked:", ep.id);
@@ -1703,37 +1802,43 @@ async function selectEpisodeFromFsPicker() {
   }
 }
 
-function renderSegments(segments) {
-  // Render the main (non-fullscreen) transcript view as a list of clickable
-  // segment rows, each containing interactive word spans and a caption div.
-  transcriptViewerEl.innerHTML = "";
+/**
+ * Build clickable segment rows into `container`.
+ * `prefix` selects the sender ("segment") or fullscreen/receiver ("fs-segment")
+ * class family; the two views are styled and highlighted independently.
+ */
+function renderSegmentRows(container, segments, prefix, fs) {
+  container.innerHTML = "";
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const row = document.createElement("div");
+    row.className = prefix;
+    row.dataset.index = String(i);
 
+    const text = document.createElement("div");
+    text.className = `${prefix}-text`;
+    appendWordSpans(text, seg.text, i, fs);
+
+    row.appendChild(text);
+    appendSegmentCaption(row, seg.translation_en, `${prefix}-caption`);
+    row.addEventListener("click", () => {
+      _seekTo(seg.start);
+    });
+
+    container.appendChild(row);
+  }
+}
+
+function renderSegments(segments) {
   if (!segments || segments.length === 0) {
+    transcriptViewerEl.innerHTML = "";
     const empty = document.createElement("div");
     empty.className = "empty";
     empty.textContent = "No timestamped transcript found for this episode.";
     transcriptViewerEl.appendChild(empty);
     return;
   }
-
-  for (let i = 0; i < segments.length; i++) {
-    const seg = segments[i];
-    const row = document.createElement("div");
-    row.className = "segment";
-    row.dataset.index = String(i);
-
-    const text = document.createElement("div");
-    text.className = "segment-text";
-    appendInteractiveText(text, seg.text, i);  // Pass segment index for word tracking
-
-    row.appendChild(text);
-    appendSegmentCaption(row, seg.translation_en, "segment-caption");
-    row.addEventListener("click", () => {
-      _seekTo(seg.start);
-    });
-
-    transcriptViewerEl.appendChild(row);
-  }
+  renderSegmentRows(transcriptViewerEl, segments, "segment", false);
 }
 
 function renderPlainText(text) {
@@ -1753,70 +1858,6 @@ function renderPlainText(text) {
     row.textContent = p;
     transcriptViewerEl.appendChild(row);
   }
-}
-
-function renderWords(words) {
-  // Alternative rendering mode: word-level view (no segment grouping).
-  // Groups words by their context string (which maps to the parent segment text)
-  // so the display still appears as rows rather than one continuous blob.
-  transcriptViewerEl.innerHTML = "";
-  if (!words || words.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "empty";
-    empty.textContent = "No word-level timing data.";
-    transcriptViewerEl.appendChild(empty);
-    return;
-  }
-
-  const container = document.createElement("div");
-  container.className = "words-container";
-
-  // Group words by segment context so the transcript appears as rows, not one blob.
-  let currentContext = null;
-  let currentRow = null;
-
-  for (let i = 0; i < words.length; i++) {
-    const word = words[i];
-    const context = word.context || "";
-
-    if (context !== currentContext) {
-      currentContext = context;
-      currentRow = document.createElement("div");
-      currentRow.className = "segment word-segment";
-      const rowStart = Number(word.start) || 0;
-      currentRow.dataset.start = String(rowStart);
-      currentRow.addEventListener("click", (e) => {
-        // Avoid double-seeking when clicking directly on a word span.
-        if (e.target && e.target.classList && e.target.classList.contains("word")) {
-          return;
-        }
-        _seekTo(rowStart);
-      });
-      container.appendChild(currentRow);
-    }
-
-    const wordEl = document.createElement("span");
-    wordEl.className = "word translatable-word";
-    wordEl.dataset.index = String(i);
-
-    // Dim words with low transcription confidence (probability < 0.6)
-    const prob = word.probability ?? 1;
-    if (prob < 0.6) {
-      wordEl.classList.add("low-confidence");
-      wordEl.title = `Low confidence: ${(prob * 100).toFixed(0)}%`;
-    }
-
-    wordEl.textContent = word.word;
-    wordEl.addEventListener("click", () => {
-      _seekTo(word.start);
-    });
-
-    attachWordHover(wordEl, word.word.trim(), context);
-    currentRow.appendChild(wordEl);
-    currentRow.appendChild(document.createTextNode(" "));
-  }
-
-  transcriptViewerEl.appendChild(container);
 }
 
 function updateActiveSegment() {
@@ -1874,8 +1915,8 @@ function updateActiveWord() {
    // No change if same word is active
    if (nextIndex === activeWordIndex) return;
 
-   // Remove previous active word highlight from all possible selectors
-   const prevEls = transcriptViewerEl.querySelectorAll("[data-word-index].active, .word.active, .translatable-word.active");
+   // Remove previous active word highlight.
+   const prevEls = transcriptViewerEl.querySelectorAll("[data-word-index].active, .translatable-word.active");
    for (const el of prevEls) {
      el.classList.remove("active");
    }
@@ -1883,16 +1924,50 @@ function updateActiveWord() {
    // Set new active word
    activeWordIndex = nextIndex;
    if (activeWordIndex >= 0) {
-     // Try multiple selectors: data-word-index (segment rendering), data-index (word rendering)
-     let activeEl = transcriptViewerEl.querySelector(`[data-word-index='${activeWordIndex}']`);
-     if (!activeEl) {
-       activeEl = transcriptViewerEl.querySelector(`.word[data-index='${activeWordIndex}']`);
-     }
+     const activeEl = transcriptViewerEl.querySelector(`[data-word-index='${activeWordIndex}']`);
      if (activeEl) {
        activeEl.classList.add("active");
       activeEl.scrollIntoView({ block: "center", behavior: "smooth" });
      }
    }
+}
+
+/**
+ * Map each segment to its slice of the flat word array.
+ *
+ * The server stamps every word with `segment_index`. Older payloads lack it, so
+ * we fall back to the original context-matching walk — which is why the stamp
+ * exists: matching on text gave segment 0 every word of segment 1 whenever two
+ * segments happened to share the same text.
+ *
+ * @returns {Array<{start: number, end: number}>} inclusive ranges; end < start means empty.
+ */
+function buildSegmentWordRanges(segments, words) {
+  if (!segments.length || !words.length) return [];
+
+  if (words[0].segment_index !== undefined) {
+    const ranges = segments.map(() => ({ start: 0, end: -1 }));
+    for (let wi = 0; wi < words.length; wi++) {
+      const range = ranges[words[wi].segment_index];
+      if (!range) continue;
+      if (range.end < range.start) range.start = wi;
+      range.end = wi;
+    }
+    return ranges;
+  }
+
+  const ranges = [];
+  let wPtr = 0;
+  for (let si = 0; si < segments.length; si++) {
+    const segCtx = (segments[si].text || "").trim().toLowerCase();
+    const startIdx = wPtr;
+    while (wPtr < words.length) {
+      if ((words[wPtr].context || "").trim().toLowerCase() !== segCtx) break;
+      wPtr++;
+    }
+    ranges.push({ start: startIdx, end: wPtr - 1 });
+  }
+  return ranges;
 }
 
 async function loadEpisode(id, { skipCastLoad = false, skipAudioSrc = false } = {}) {
@@ -1962,16 +2037,7 @@ async function loadEpisode(id, { skipCastLoad = false, skipAudioSrc = false } = 
       currentWords = data.words || [];
 
       if (currentWords.length > 0) {
-        let wPtr = 0;
-        for (let si = 0; si < currentSegments.length; si++) {
-          const segCtx = (currentSegments[si].text || "").trim().toLowerCase();
-          const startIdx = wPtr;
-          while (wPtr < currentWords.length) {
-            if ((currentWords[wPtr].context || "").trim().toLowerCase() !== segCtx) break;
-            wPtr++;
-          }
-          segmentWordRanges.push({ start: startIdx, end: wPtr - 1 });
-        }
+        segmentWordRanges = buildSegmentWordRanges(currentSegments, currentWords);
       }
 
       renderSegments(currentSegments);
@@ -2023,125 +2089,11 @@ function applyFilter() {
 // ── Fullscreen ──────────────────────────────────────────────────────────────
 
 function appendFsInteractiveText(container, text, segmentIndex = -1) {
-  // Same as appendInteractiveText but uses data-fs-word-index attributes
-  // so fullscreen word highlighting doesn't collide with normal view selectors.
-  const range = (segmentIndex >= 0 && segmentWordRanges[segmentIndex]) ? segmentWordRanges[segmentIndex] : null;
-
-  if (range && range.start <= range.end && currentWords.length > 0) {
-    for (let i = range.start; i <= range.end; i++) {
-      const w = currentWords[i];
-      if (!w) continue;
-
-      const raw = w.word || "";
-      const trimmed = raw.trimStart();
-      const hasLeadingSpace = raw.length !== trimmed.length;
-
-      if (hasLeadingSpace && container.childNodes.length > 0) {
-        container.appendChild(document.createTextNode(" "));
-      }
-
-      const wordEl = document.createElement("span");
-      wordEl.className = "translatable-word";
-      wordEl.textContent = trimmed;
-      wordEl.dataset.fsWordIndex = String(i);
-      wordEl.setAttribute("data-fs-start", w.start);
-      wordEl.setAttribute("data-fs-end", w.end);
-
-      const prob = w.probability ?? 1;
-      if (prob < 0.6) {
-        wordEl.classList.add("low-confidence");
-        wordEl.title = `Low confidence: ${(prob * 100).toFixed(0)}%`;
-      }
-
-      wordEl.addEventListener("click", (e) => {
-        e.stopPropagation();   // don't bubble to segment row
-        _seekTo(w.start);
-      });
-
-      attachWordHover(wordEl, trimmed, text);
-      container.appendChild(wordEl);
-    }
-  } else {
-    // Fallback: plain whitespace split.
-    const parts = text.split(/(\s+)/);
-    for (const part of parts) {
-      if (!part) continue;
-      if (/^\s+$/.test(part)) {
-        container.appendChild(document.createTextNode(part));
-        continue;
-      }
-      const wordEl = document.createElement("span");
-      wordEl.className = "translatable-word";
-      wordEl.textContent = part;
-      attachWordHover(wordEl, part, text);
-      container.appendChild(wordEl);
-    }
-  }
+  appendWordSpans(container, text, segmentIndex, true);
 }
 
 function renderFsSegments(segments) {
-  fsTranscriptEl.innerHTML = "";
-  for (let i = 0; i < segments.length; i++) {
-    const seg = segments[i];
-    const row = document.createElement("div");
-    row.className = "fs-segment";
-    row.dataset.index = String(i);
-    const text = document.createElement("div");
-    text.className = "fs-segment-text";
-    appendFsInteractiveText(text, seg.text, i);  // Pass segment index
-    row.appendChild(text);
-    appendSegmentCaption(row, seg.translation_en, "fs-segment-caption");
-    row.addEventListener("click", () => {
-      _seekTo(seg.start);
-    });
-    fsTranscriptEl.appendChild(row);
-  }
-}
-
-function renderFsWords(words) {
-  fsTranscriptEl.innerHTML = "";
-  if (!words || words.length === 0) return;
-  let currentContext = null;
-  let currentRow = null;
-  for (let i = 0; i < words.length; i++) {
-    const word = words[i];
-    const context = word.context || "";
-    if (context !== currentContext) {
-      currentContext = context;
-      currentRow = document.createElement("div");
-      currentRow.className = "fs-segment word-segment";
-      const rowStart = Number(word.start) || 0;
-      currentRow.dataset.start = String(rowStart);
-      currentRow.addEventListener("click", (e) => {
-        if (e.target && e.target.classList && e.target.classList.contains("fs-word")) return;
-        _seekTo(rowStart);
-      });
-      fsTranscriptEl.appendChild(currentRow);
-    }
-    const wordEl = document.createElement("span");
-    wordEl.className = "fs-word translatable-word";
-    wordEl.dataset.index = String(i);
-    const prob = word.probability ?? 1;
-    if (prob < 0.6) {
-      wordEl.classList.add("low-confidence");
-      wordEl.title = `Low confidence: ${(prob * 100).toFixed(0)}%`;
-    }
-    wordEl.textContent = word.word;
-    wordEl.addEventListener("click", () => {
-      _seekTo(word.start);
-    });
-    attachWordHover(wordEl, word.word.trim(), context);
-    currentRow.appendChild(wordEl);
-    currentRow.appendChild(document.createTextNode(" "));
-  }
-}
-
-function _hideFsOverlay() {
-  isFullscreen = false;
-  fsActiveSegmentIndex = -1;
-  fsActiveWordIndex = -1;
-  fsOverlayEl.classList.remove("fs-paused");
-  fsOverlayEl.classList.add("hidden");
+  renderSegmentRows(fsTranscriptEl, segments, "fs-segment", true);
 }
 
 function updateFsCaptionVisibility() {
@@ -2240,7 +2192,7 @@ function enterFullscreen() {
     }
   }
   if (activeWordIndex >= 0) {
-    const el = fsTranscriptEl.querySelector(`[data-fs-word-index='${activeWordIndex}'], .fs-word[data-index='${activeWordIndex}']`);
+    const el = fsTranscriptEl.querySelector(`[data-fs-word-index='${activeWordIndex}']`);
     if (el) {
       el.classList.add("active");
       fsActiveWordIndex = activeWordIndex;
@@ -2317,14 +2269,11 @@ function updateFsActiveWord() {
    // Segment-level .active is managed exclusively by updateFsActiveSegment —
    // touching it here caused the whole segment to lose its highlight when a
    // word couldn't be matched (e.g. Whisper splits "Top-Segment," into two tokens).
-   fsTranscriptEl.querySelectorAll("[data-fs-word-index].active, .fs-word.active")
+   fsTranscriptEl.querySelectorAll("[data-fs-word-index].active")
      .forEach(el => el.classList.remove("active"));
 
    fsActiveWordIndex = nextIndex;
-   let activeEl = fsTranscriptEl.querySelector(`[data-fs-word-index='${fsActiveWordIndex}']`);
-   if (!activeEl) {
-     activeEl = fsTranscriptEl.querySelector(`.fs-word[data-index='${fsActiveWordIndex}']`);
-   }
+   const activeEl = fsTranscriptEl.querySelector(`[data-fs-word-index='${fsActiveWordIndex}']`);
    if (activeEl) {
      activeEl.classList.add("active");
      // Scrolling is handled at segment granularity by updateFsActiveSegment;
@@ -2385,6 +2334,160 @@ if (receiverToggleBtnEl) {
       _toggleLongPressTimer = null;
     }
     _toggleDidLongPress = false;
+  });
+}
+
+document.addEventListener("fullscreenchange", () => {
+  if (isFullscreen) {
+    fsOverlayEl.classList.remove("hidden");
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+
+// ── Translation toggle ──────────────────────────────────────────────────────
+
+function updateTranslationVisibility() {
+  if (translationsVisible) {
+    transcriptViewerEl.classList.remove("hide-translations");
+    translationToggleBtnEl.classList.add("active");
+  } else {
+    transcriptViewerEl.classList.add("hide-translations");
+    translationToggleBtnEl.classList.remove("active");
+  }
+}
+
+translationToggleBtnEl.addEventListener("click", () => {
+  translationsVisible = !translationsVisible;
+  updateTranslationVisibility();
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+
+async function init() {
+  castLog("INFO", "init() starting");
+  try {
+    if (receiverMode) {
+      castLog("INFO", "entering receiver mode");
+      enterFullscreen();
+
+      // Set up Cast receiver for real Chromecast (auth token arrives via
+      // namespace → loadEpisodesForReceiver).  In a regular browser the SDK
+      // won't be found and initCastReceiver retries harmlessly.
+      initCastReceiver();
+
+      // Also try to load episodes immediately using cookie auth — this works
+      // when testing in a browser.  On actual Chromecast (no cookies) this
+      // will 401, which is fine; the Cast auth token flow handles it.
+      if (!episodes.length) {
+        castLog("INFO", "attempting eager episode load (cookie auth)");
+        try {
+          await loadRuntimeConfig();
+          episodes = await fetchJson("/api/episodes");
+          filteredEpisodes = episodes.slice();
+          castLog("OK", "eager load succeeded:", episodes.length, "episodes");
+          renderEpisodeList();
+        } catch (err) {
+          castLog("INFO", "eager load failed (expected on Chromecast):", err.message);
+        }
+      }
+
+      if (!currentEpisodeId) {
+        openFsEpisodePicker();
+      }
+      return;
+    }
+
+    // Sender mode: normal auth + data load flow.
+    await ensureAuthenticatedSession();
+    castLog("INFO", "auth session ensured");
+    await loadRuntimeConfig();
+    episodes = await fetchJson("/api/episodes");
+    filteredEpisodes = episodes.slice();
+    statusTextEl.textContent = `${episodes.length} episode(s) found.`;
+    castLog("INFO", "episodes loaded:", episodes.length);
+    renderEpisodeList();
+
+    castLog("INFO", "entering sender mode");
+    initCastSender();
+  } catch (err) {
+    castLog("ERROR", "init failed:", err.message);
+    statusTextEl.textContent = `Error: ${err.message}`;
+  }
+}
+
+audioEl.addEventListener("timeupdate", () => {
+  updateActiveSegment();
+  updateActiveWord();
+  updateFsProgress();
+  updateFsActiveSegment();
+  updateFsActiveWord();
+});
+audioEl.addEventListener("seeked", () => {
+  castLog("INFO", "audioEl seeked — time:", audioEl.currentTime.toFixed(2),
+    "paused:", audioEl.paused, "casting:", _isCasting());
+  if (isFullscreen) {
+    fsTranscriptEl.querySelectorAll(".fs-segment.active").forEach(el => el.classList.remove("active"));
+    fsTranscriptEl.querySelectorAll("[data-fs-word-index].active").forEach(el => el.classList.remove("active"));
+  }
+  transcriptViewerEl.querySelectorAll(".segment.active").forEach(el => el.classList.remove("active"));
+  transcriptViewerEl.querySelectorAll("[data-word-index].active").forEach(el => el.classList.remove("active"));
+
+  fsActiveSegmentIndex = -1;
+  fsActiveWordIndex = -1;
+  activeSegmentIndex = -1;
+  activeWordIndex = -1;
+  updateActiveSegment();
+  updateActiveWord();
+  updateFsActiveSegment();
+  updateFsActiveWord();
+});
+audioEl.addEventListener("play", () => {
+  castLog("INFO", "audioEl play — time:", audioEl.currentTime.toFixed(2),
+    "muted:", audioEl.muted, "casting:", _isCasting());
+  updateFsCaptionVisibility();
+});
+audioEl.addEventListener("pause", () => {
+  castLog("INFO", "audioEl pause — time:", audioEl.currentTime.toFixed(2),
+    "muted:", audioEl.muted, "casting:", _isCasting());
+  updateFsCaptionVisibility();
+  ensureActiveSegmentTranslation();
+});
+audioEl.addEventListener("error", () => {
+  const e = audioEl.error;
+  castLog("ERROR", "audioEl error — code:", e ? e.code : "?", "message:", e ? e.message : "?",
+    "src:", audioEl.src ? audioEl.src.substring(0, 80) : "empty");
+});
+audioEl.addEventListener("loadstart", () => {
+  castLog("INFO", "audioEl loadstart — src:", audioEl.src ? audioEl.src.substring(0, 80) : "empty");
+});
+audioEl.addEventListener("canplay", () => {
+  castLog("INFO", "audioEl canplay — duration:", audioEl.duration ? audioEl.duration.toFixed(1) : "?",
+    "time:", audioEl.currentTime.toFixed(2));
+});
+audioEl.addEventListener("waiting", () => {
+  castLog("WARN", "audioEl waiting (buffering) — time:", audioEl.currentTime.toFixed(2));
+});
+audioEl.addEventListener("stalled", () => {
+  castLog("WARN", "audioEl stalled — time:", audioEl.currentTime.toFixed(2),
+    "networkState:", audioEl.networkState);
+});
+
+searchInputEl.addEventListener("input", applyFilter);
+window.addEventListener("scroll", hideTooltip, true);
+
+if (receiverEpisodesBtnEl) {
+  receiverEpisodesBtnEl.addEventListener("click", () => {
+    if (isFsEpisodePickerOpen) {
+      if (currentEpisodeId) closeFsEpisodePicker();
+    } else {
+      openFsEpisodePicker();
+    }
+  });
+}
+if (fsEpisodePickerCloseBtnEl) {
+  fsEpisodePickerCloseBtnEl.addEventListener("click", () => {
+    if (currentEpisodeId) closeFsEpisodePicker();
   });
 }
 
