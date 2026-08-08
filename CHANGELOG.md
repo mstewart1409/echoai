@@ -1,3 +1,9 @@
+## 0.15.0 (2026-08-08)
+
+### Feat
+
+- enhance logging functionality with client timestamps and improve transport synchronization
+
 ## 0.14.0 (2026-08-08)
 
 ### Feat
