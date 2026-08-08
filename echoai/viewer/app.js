@@ -435,7 +435,7 @@ function logSyncHeartbeat() {
   if (receiverMode) {
     castLog("INFO", `hb receiver: ${local} ${_mediaSummary()}` +
       ` seg=${fsActiveSegmentIndex} word=${fsActiveWordIndex}` +
-      ` token=${receiverAuthToken ? "yes" : "NO"} pinned=${receiverPausedAtTime ?? "-"}`);
+      ` auth=${receiverAuthToken ? "yes" : "NO"} pinned=${receiverPausedAtTime ?? "-"}`);
     return;
   }
 
@@ -507,6 +507,9 @@ let remotePlayer = null;              // cast.framework.RemotePlayer — tracks 
 let remotePlayerController = null;    // cast.framework.RemotePlayerController — sends commands
 let castTimeSyncInterval = null;      // 500ms drift correction interval ID
 let castTokenRefreshInterval = null;  // Periodic auth token refresh interval ID
+// [eventType, handler] pairs registered on remotePlayerController, so teardown
+// can detach them. Without this every re-setup leaked a full set of listeners.
+let castSyncListeners = [];
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -543,7 +546,7 @@ function _seekTo(time, autoPlay = true) {
     // Marked: this play is ours, and the explicit remote resume below already
     // covers the receiver. Without the mark the mirror would fire too and the
     // two toggles would cancel out, leaving the receiver paused.
-    markProgrammaticTransport();
+    markProgrammaticTransport(false);
     audioEl.play().catch((err) => {
       castLog("WARN", "_seekTo play failed:", err.message);
     });
@@ -592,12 +595,20 @@ function _unmuteSenderForCast() {
 function _ensureLocalMutedPlayback() {
   if (receiverMode) return;
   if (!audioEl.src) return;
+  // Never resume a parked element. The sender is deliberately stopped during a
+  // cast handover or episode change until the receiver confirms the new media;
+  // resuming here would undo the park and let it run ahead again. Enforced in
+  // this one function so every caller is covered, present and future.
+  if (isEpisodeTransitionActive(Date.now())) {
+    castLogDebug("_ensureLocalMutedPlayback: suppressed — handover in progress");
+    return;
+  }
   audioEl.muted = true;
   if (audioEl.paused) {
     // The only place local playback is started programmatically — marking it
     // here keeps the resulting 'play' event from being mirrored back as user
     // intent, whichever caller triggered it.
-    markProgrammaticTransport();
+    markProgrammaticTransport(false);
     audioEl.play().catch((err) => {
       castLog("WARN", "_ensureLocalMutedPlayback failed:", err.message);
     });
@@ -801,11 +812,23 @@ async function loadCurrentEpisodeOnCastSession(session, startTime = 0) {
   const meta = getCurrentEpisodeMeta();
   if (!meta) { castLog("WARN", "loadCurrentEpisodeOnCastSession: no episode meta"); return; }
 
-  castLog("INFO", "loading media on Cast session:", meta.id, meta.mediaUrl, "startTime:", startTime);
+  // Minting a token is a network round trip, and this function is never
+  // awaited. Switching episodes quickly could therefore let an older call
+  // finish last and load the PREVIOUS episode onto the receiver — the sender
+  // and receiver then disagreed about which episode was playing.
+  const loadToken = activeEpisodeLoadToken;
+  const isStale = () => loadToken !== activeEpisodeLoadToken;
+
+  castLog("INFO", "loading media on Cast session:", meta.id, meta.mediaUrl,
+    "startTime:", startTime.toFixed ? startTime.toFixed(2) : startTime, "token:", loadToken);
 
   let mediaUrl = meta.mediaUrl;
   try {
     const token = await requestCastSessionToken(meta.id);
+    if (isStale()) {
+      castLog("INFO", `abandoning stale cast load for ${meta.id} (token ${loadToken})`);
+      return;
+    }
     if (token) {
       mediaUrl = `${meta.mediaUrl}${meta.mediaUrl.includes("?") ? "&" : "?"}rt=${encodeURIComponent(token)}`;
       castLog("INFO", "cast token appended to media URL");
@@ -813,6 +836,7 @@ async function loadCurrentEpisodeOnCastSession(session, startTime = 0) {
   } catch (err) {
     castLog("ERROR", "cast token request failed:", err.message);
     statusTextEl.textContent = err.message;
+    endEpisodeTransition("cast token failed");
     return;
   }
 
@@ -833,8 +857,14 @@ async function loadCurrentEpisodeOnCastSession(session, startTime = 0) {
   castLog("INFO", "sending LoadRequest — currentTime:", request.currentTime);
   session.loadMedia(request,
     () => {
-      castLog("OK", "media loaded successfully on receiver");
-      // Both ends now describe the same media — safe to reconcile again.
+      castLog("OK", `media loaded on receiver: ${meta.id} @ ${startTime.toFixed ? startTime.toFixed(2) : startTime}s`);
+      if (isStale()) {
+        castLog("INFO", "load completed for a superseded episode — leaving sync suspended");
+        return;
+      }
+      // Both ends now describe the same media — safe to reconcile again. The
+      // first reconcile aligns the parked local element to the receiver before
+      // resuming it, which is what makes the handover seamless.
       endEpisodeTransition("loadMedia ok");
     },
     (err) => {
@@ -889,6 +919,46 @@ const TRANSPORT_ECHO_WINDOW_MS = 250;
 const CAST_EPISODE_TRANSITION_MS = 8000;
 
 /**
+ * Minimum gap between position snaps.
+ *
+ * Every snap seeks the local element, a seek forces a re-buffer, and while it
+ * re-buffers the local clock stalls while the receiver's keeps running — so the
+ * drift that triggered the snap comes straight back. Field logs showed exactly
+ * that loop, oscillating between 38.9s and 40.0s and dragging the transcript
+ * (and its lazy translations) around with it. Snapping is a correction of last
+ * resort, not something to do four times a second.
+ */
+const CAST_MIN_SNAP_INTERVAL_MS = 3000;
+
+/**
+ * Drift above which we give up nudging and seek outright.
+ *
+ * Seeking is violent: it empties the buffer, fires `waiting`, and makes the
+ * browser's native audio widget flash between play and paused — the flicker
+ * reported from the field. It is the right tool only for a genuine jump (a user
+ * seek, an episode change), never for the second or so of slippage a muted
+ * clock naturally accumulates.
+ */
+const CAST_SEEK_THRESHOLD_SEC = 3;
+
+/**
+ * Playback-rate nudge used to close small drift instead of seeking.
+ *
+ * The local element is muted, so speeding it up or slowing it down by 5% is
+ * completely inaudible, costs no buffering, and converges a 1s error in about
+ * 20s. This is the standard way to slave one clock to another without glitching.
+ */
+const CAST_NUDGE_RATE = 0.05;
+
+/**
+ * How long after sending a transport command the reconciler leaves play state
+ * alone. The receiver needs a round trip to report the new state; without this
+ * the very next poll sees "remote still playing, local paused" and undoes the
+ * user's pause before the command has even landed.
+ */
+const TRANSPORT_COMMAND_SETTLE_MS = 2000;
+
+/**
  * Heartbeat period. Deliberately slow: at 10s each client contributes 6 log
  * entries a minute, a rounding error against the server's per-minute cap, while
  * still giving enough resolution to reconstruct a playback timeline.
@@ -900,6 +970,8 @@ const CAST_HEARTBEAT_MS = 10000;
 // stopped, so we corroborate it with "has the clock actually moved lately".
 let lastRemoteTime = -1;
 let lastRemoteMoveAt = 0;
+// When the last position snap happened, enforcing CAST_MIN_SNAP_INTERVAL_MS.
+let lastSnapAt = 0;
 
 function castShouldSnap(localTime, remoteTime) {
   return Math.abs(localTime - remoteTime) > CAST_DRIFT_TOLERANCE_SEC;
@@ -943,10 +1015,25 @@ function remoteIsMoving(now) {
 // as usual — the receiver stays the single source of truth.
 
 let lastProgrammaticTransportAt = 0;
+// The play state the reconciler last asked the local element to be in.
+// Comparing against this is how a user's play/pause is told apart from our own,
+// and it is deterministic — the earlier time-window approach silently swallowed
+// real pauses whenever buffering had made the reconciler act in the last 250ms,
+// which on a Pi was most of the time.
+let commandedLocalPaused = null;
 
 /** Mark a transport change as ours, so its event is not mistaken for the user. */
-function markProgrammaticTransport() {
+function markProgrammaticTransport(pausedState) {
   lastProgrammaticTransportAt = Date.now();
+  if (pausedState !== undefined) commandedLocalPaused = pausedState;
+}
+
+// Set when we send a transport command to the receiver; until it expires the
+// reconciler must not "correct" the play state it is still waiting on.
+let transportCommandUntil = 0;
+
+function isTransportCommandPending(now) {
+  return now < transportCommandUntil;
 }
 
 // ── Episode transitions ─────────────────────────────────────────────────────
@@ -983,15 +1070,45 @@ function isEpisodeTransitionActive(now) {
 }
 
 /**
+ * Park the sender's local element while the receiver takes over or catches up.
+ *
+ * Starting a cast — and switching episode mid-cast — is a handover, not a fork.
+ * Previously the sender kept playing (muted) through the token mint and the
+ * LOAD round trip, so by the time the receiver reported in it was a second or
+ * more ahead, and the reconciler dragged it backwards: the visible "steps far
+ * back". Parking makes the handover position stable, and for a cast start it is
+ * also simply what the user expects — playback moves to the TV.
+ *
+ * Reuses the episode-transition window, which already suspends the whole
+ * reconciler, so nothing touches the local clock until the receiver confirms.
+ * The first reconcile after that aligns the parked element before resuming it.
+ */
+function parkSenderForHandover(reason) {
+  beginEpisodeTransition(reason, true);
+  if (!audioEl.paused) {
+    castLog("INFO", `${reason}: parking sender at ${audioEl.currentTime.toFixed(2)}s`);
+    markProgrammaticTransport(true);
+    audioEl.pause();
+  }
+}
+
+/** Cast session start: mute the sender and park it until the receiver has media. */
+function beginCastHandover() {
+  _muteSenderForCast();
+  parkSenderForHandover("cast handover");
+}
+
+/**
  * Should a local play/pause be forwarded to the receiver?
  *
- * Pure, so the echo-suppression logic is testable without a Cast SDK. False
- * when the change was our own (echo) or when both ends already agree —
- * forwarding then would toggle the receiver into the wrong state.
+ * Pure, so the logic is testable without a Cast SDK. `commanded` is the state
+ * the reconciler last asked for: if the element now matches it, this event is
+ * our own change echoing back. If it differs, the user did it. Comparing intent
+ * rather than timing is what makes this reliable while buffering churns.
  */
-function shouldMirrorTransport(localPaused, remotePaused, isEcho) {
-  if (isEcho) return false;
-  return localPaused !== remotePaused;
+function shouldMirrorTransport(localPaused, remotePaused, commanded) {
+  if (localPaused === commanded) return false;   // our own change echoing back
+  return localPaused !== remotePaused;           // already agree → nothing to send
 }
 
 /** Forward a user-initiated local play/pause to the receiver. */
@@ -999,13 +1116,14 @@ function mirrorLocalTransportToRemote() {
   if (receiverMode || !_isCasting()) return;
   if (!remotePlayer || remotePlayer.duration <= 0) return;
 
-  const isEcho = Date.now() - lastProgrammaticTransportAt < TRANSPORT_ECHO_WINDOW_MS;
-  if (!shouldMirrorTransport(audioEl.paused, remotePlayer.isPaused, isEcho)) return;
+  if (!shouldMirrorTransport(audioEl.paused, remotePlayer.isPaused, commandedLocalPaused)) return;
 
   castLog("INFO", `transport: mirroring local ${audioEl.paused ? "pause" : "play"} to receiver`);
   remotePlayerController.playOrPause();
-  // The receiver's clock is about to change state; give it a fresh grace window
-  // so the reconciler does not read the transition as a stall.
+  // The user's intent is now the commanded state — and hold the reconciler off
+  // the play state until the receiver has had time to report back.
+  commandedLocalPaused = audioEl.paused;
+  transportCommandUntil = Date.now() + TRANSPORT_COMMAND_SETTLE_MS;
   resetRemoteClockGrace(Date.now());
 }
 
@@ -1026,6 +1144,40 @@ function mirrorLocalTransportToRemote() {
  *
  * @param {string} reason - Trigger name, for the debug log only.
  */
+/**
+ * How the local clock should be brought back to the receiver.
+ *
+ * Pure so the policy is testable without a media element.
+ *  - "none"  : inside tolerance, leave it entirely alone
+ *  - "nudge" : small drift while playing — adjust playbackRate, silent and
+ *              buffer-free
+ *  - "seek"  : a real jump, or any correction while paused
+ *
+ * A paused element cannot be nudged: playbackRate only has an effect during
+ * playback. So while paused, seeking is the only option — and it is harmless
+ * there, because a stopped clock cannot feed the seek/re-buffer loop that made
+ * seeking the wrong choice during playback.
+ */
+function driftCorrection(localTime, remoteTime, localPaused) {
+  const magnitude = Math.abs(localTime - remoteTime);
+  if (magnitude <= CAST_DRIFT_TOLERANCE_SEC) return "none";
+  if (localPaused) return "seek";
+  if (magnitude >= CAST_SEEK_THRESHOLD_SEC) return "seek";
+  return "nudge";
+}
+
+/** Playback rate that closes `drift` (local minus remote) without seeking. */
+function nudgeRateFor(localTime, remoteTime) {
+  // Ahead of the receiver → run slower; behind → run faster.
+  return localTime > remoteTime ? 1 - CAST_NUDGE_RATE : 1 + CAST_NUDGE_RATE;
+}
+
+function setLocalPlaybackRate(rate) {
+  if (audioEl.playbackRate === rate) return;
+  audioEl.playbackRate = rate;
+  castLogDebug(`sync: playbackRate → ${rate}`);
+}
+
 function reconcileLocalToRemote(reason) {
   if (receiverMode || !_isCasting()) return;
   if (!remotePlayer || remotePlayer.duration <= 0) return;
@@ -1038,10 +1190,39 @@ function reconcileLocalToRemote(reason) {
   const remoteTime = remotePlayer.currentTime;
   noteRemoteClock(remoteTime, now);
 
-  if (castShouldSnap(audioEl.currentTime, remoteTime)) {
+  // Position. Nudge for small drift, seek only for a genuine jump — see
+  // driftCorrection(). Seeking to fix a second of slippage emptied the buffer
+  // on every correction, which is what made the audio widget flicker.
+  const settling = audioEl.seeking || audioEl.readyState < 3; // < HAVE_FUTURE_DATA
+  const correction = settling
+    ? "none"
+    : driftCorrection(audioEl.currentTime, remoteTime, audioEl.paused);
+
+  // The cooldown exists to break the seek→buffer→drift loop, which only runs
+  // while playing. A paused element is stationary, so its correction is a
+  // one-off and must not be deferred.
+  const seekAllowed = audioEl.paused || now - lastSnapAt >= CAST_MIN_SNAP_INTERVAL_MS;
+
+  if (correction === "seek" && seekAllowed) {
     const drift = audioEl.currentTime - remoteTime;
-    castLog("INFO", `sync[${reason}]: snap ${drift.toFixed(1)}s → ${remoteTime.toFixed(1)}s`);
+    castLog("INFO", `sync[${reason}]: seek ${drift.toFixed(1)}s → ${remoteTime.toFixed(1)}s`);
+    lastSnapAt = now;
+    setLocalPlaybackRate(1);
     audioEl.currentTime = remoteTime;
+  } else if (correction === "seek") {
+    castLogDebug(`sync[${reason}]: seek deferred by cooldown` +
+      ` (drift ${(audioEl.currentTime - remoteTime).toFixed(2)}s)`);
+  } else if (correction === "nudge") {
+    setLocalPlaybackRate(nudgeRateFor(audioEl.currentTime, remoteTime));
+  } else if (!settling) {
+    setLocalPlaybackRate(1);
+  }
+
+  // Play state. Left alone while a transport command we sent is still in
+  // flight, or the very next poll undoes the user's own pause.
+  if (isTransportCommandPending(now)) {
+    castLogDebug(`sync[${reason}]: transport command pending — play state held`);
+    return;
   }
 
   const shouldPlay = !remotePlayer.isPaused && remoteIsMoving(now);
@@ -1050,10 +1231,12 @@ function reconcileLocalToRemote(reason) {
     _ensureLocalMutedPlayback();
   } else if (!shouldPlay && !audioEl.paused) {
     castLog("INFO", `sync[${reason}]: pausing local (remote stopped)`);
-    // Marked so the resulting 'pause' event is not read back as the user
-    // pausing, which would bounce a command straight back to the receiver.
-    markProgrammaticTransport();
+    markProgrammaticTransport(true);
     audioEl.pause();
+  } else {
+    // Nothing to do, but record what state we believe the element should be in
+    // so a later user action is recognisable as a departure from it.
+    commandedLocalPaused = !shouldPlay;
   }
 }
 
@@ -1075,27 +1258,29 @@ function setupCastSync(session) {
   lastRemoteTime = -1;
   resetRemoteClockGrace(Date.now());
 
-  // Kick-start local muted playback so the sender UI tracks position from
-  // the moment casting begins — don't wait for the first reconcile, which
-  // needs a non-zero remote duration and may be one media-status away.
+  // Kick-start local muted playback so the sender UI tracks position from the
+  // moment casting begins. Suppressed automatically during a handover — see
+  // _ensureLocalMutedPlayback().
   _ensureLocalMutedPlayback();
 
   // Every trigger below does the same thing: report to the reconciler.
-  remotePlayerController.addEventListener(
-    cast.framework.RemotePlayerEventType.IS_PAUSED_CHANGED,
-    () => {
-      castLog("INFO", "remote IS_PAUSED_CHANGED — paused:", remotePlayer.isPaused);
-      // An explicit transition is trustworthy — restart the grace window so a
-      // resume isn't misread as a stall in the moment before the clock ticks.
-      resetRemoteClockGrace(Date.now());
-      reconcileLocalToRemote("pause-changed");
-    }
-  );
+  // Registered through onRemote() so teardown can actually detach them.
+  const onRemote = (typeName, handler) => {
+    const type = cast.framework.RemotePlayerEventType[typeName];
+    if (!type) { castLog("WARN", "RemotePlayerEventType missing:", typeName); return; }
+    remotePlayerController.addEventListener(type, handler);
+    castSyncListeners.push([type, handler]);
+  };
 
-  remotePlayerController.addEventListener(
-    cast.framework.RemotePlayerEventType.CURRENT_TIME_CHANGED,
-    () => reconcileLocalToRemote("time-changed")
-  );
+  onRemote("IS_PAUSED_CHANGED", () => {
+    castLog("INFO", "remote IS_PAUSED_CHANGED — paused:", remotePlayer.isPaused);
+    // An explicit transition is trustworthy — restart the grace window so a
+    // resume isn't misread as a stall in the moment before the clock ticks.
+    resetRemoteClockGrace(Date.now());
+    reconcileLocalToRemote("pause-changed");
+  });
+
+  onRemote("CURRENT_TIME_CHANGED", () => reconcileLocalToRemote("time-changed"));
 
   castTimeSyncInterval = setInterval(
     () => reconcileLocalToRemote("poll"),
@@ -1105,17 +1290,14 @@ function setupCastSync(session) {
   // The receiver can vanish without a clean SESSION_ENDED (app crash, device
   // reboot, network drop). Without this the sender keeps a dead castSession,
   // stays muted, and silently mirrors every seek into the void.
-  remotePlayerController.addEventListener(
-    cast.framework.RemotePlayerEventType.IS_CONNECTED_CHANGED,
-    () => {
-      if (remotePlayer && remotePlayer.isConnected) return;
-      castLog("WARN", "remote disconnected — tearing down cast sync");
-      castSession = null;
-      teardownCastSync();
-      _unmuteSenderForCast();
-      updateCastButtonState();
-    }
-  );
+  onRemote("IS_CONNECTED_CHANGED", () => {
+    if (remotePlayer && remotePlayer.isConnected) return;
+    castLog("WARN", "remote disconnected — tearing down cast sync");
+    castSession = null;
+    teardownCastSync();
+    _unmuteSenderForCast();
+    updateCastButtonState();
+  });
 
   // Listen for custom namespace messages from the receiver (e.g. episode changes).
   session.addMessageListener(CAST_NAMESPACE, (_namespace, messageStr) => {
@@ -1163,15 +1345,33 @@ function teardownCastSync() {
     clearInterval(castTokenRefreshInterval);
     castTokenRefreshInterval = null;
   }
+  // Detach listeners explicitly. Dropping the controller reference is NOT
+  // enough — the framework holds its own reference, so every re-setup left a
+  // live set behind and each Cast event was then handled two or three times
+  // over. That is what produced the repeated IS_PAUSED_CHANGED lines and the
+  // pairs of opposing snaps in the same millisecond.
+  if (remotePlayerController && castSyncListeners.length) {
+    castLog("INFO", `detaching ${castSyncListeners.length} cast listeners`);
+    for (const [type, handler] of castSyncListeners) {
+      try {
+        remotePlayerController.removeEventListener(type, handler);
+      } catch (err) {
+        castLog("WARN", "removeEventListener failed:", err.message);
+      }
+    }
+  }
+  castSyncListeners = [];
   remotePlayer = null;
   remotePlayerController = null;
+  // A nudge must never outlive the cast session, or local playback runs 5% off
+  // pitch for the rest of the session.
+  if (!receiverMode) audioEl.playbackRate = 1;
   // Reset the clock tracker — a later session must not inherit this one's
   // movement window and mistake a cold receiver for a live one.
   lastRemoteTime = -1;
   lastRemoteMoveAt = 0;
   castLog("INFO", "Cast sync torn down");
 }
-
 /**
  * Attach the sender to a session that already has media loaded (resumed, or
  * auto-joined before our listeners existed).
@@ -1246,10 +1446,14 @@ function initCastSender() {
       updateCastButtonState();
 
       if (event.sessionState === cast.framework.SessionState.SESSION_STARTED && castSession) {
-        castLog("OK", "new Cast session started — sending auth + loading media");
-        _muteSenderForCast();
+        castLog("OK", "new Cast session started — handing over to receiver");
+        beginCastHandover();
         setupCastSync(castSession);
         void sendAuthToReceiver(castSession);
+        // Hand over from exactly where the user is now. Captured after the
+        // pause above, so it cannot drift while the token mint and LOAD are in
+        // flight — previously the sender played on for a second or two and was
+        // then yanked backwards when the receiver finally reported in.
         void loadCurrentEpisodeOnCastSession(castSession, audioEl.currentTime || 0);
       }
       if (event.sessionState === cast.framework.SessionState.SESSION_RESUMED && castSession) {
@@ -2417,7 +2621,16 @@ async function loadEpisode(id, { skipCastLoad = false, skipAudioSrc = false } = 
   // the two ends agree on which media is loaded, their clocks describe
   // different timelines and comparing them corrupts whichever side is behind.
   if (_isCasting()) {
-    beginEpisodeTransition(`loading ${id}`, !skipCastLoad);
+    if (skipCastLoad) {
+      // The receiver switched first and already has the episode — we are only
+      // catching up locally, so there is nothing to park.
+      beginEpisodeTransition(`loading ${id}`, false);
+    } else {
+      // We are driving the change: park the sender until the receiver has the
+      // new episode, or it plays the opening seconds alone and is then pulled
+      // back when the receiver finally reports in.
+      parkSenderForHandover(`loading ${id}`);
+    }
   }
   currentEpisodeId = id;
   closeFsEpisodePicker();
@@ -3008,6 +3221,34 @@ if (fsEpisodePickerCloseBtnEl) {
 // ── Long-press Enter/Space tracking for debug panel toggle ──────────────
 let _enterLongPressTimer = null;
 let _enterDidLongPress = false;
+
+/**
+ * Spacebar play/pause on the normal (non-fullscreen) sender page.
+ *
+ * The main key handler below returns immediately unless isFullscreen, so
+ * spacebar here relied entirely on the browser's default action for a focused
+ * <audio> element. Whenever focus was anywhere else — which is most of the
+ * time, and now that the page has a Logs link, easy to end up in — space did
+ * its other default instead and scrolled the page.
+ *
+ * Routing through togglePlayPause() also means the receiver follows, via the
+ * same transport mirror as the on-screen controls.
+ */
+document.addEventListener("keydown", (e) => {
+  if (isFullscreen || receiverMode) return;
+  if (e.key !== " " && e.code !== "Space") return;
+  // Never steal the key from somewhere the user is typing, or from a control
+  // whose own space behaviour is the point (buttons, checkboxes, links).
+  const target = e.target;
+  const tag = target && target.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON" ||
+      tag === "A" || (target && target.isContentEditable)) {
+    return;
+  }
+  e.preventDefault();   // stop the page scrolling
+  castLog("INFO", "key: Space → togglePlayPause (sender)");
+  togglePlayPause();
+});
 
 document.addEventListener("keydown", async (e) => {
   if (!isFullscreen) return;

@@ -708,3 +708,14 @@ body.receiver-mode #fsTranscript {
   background: #fff;
 }
 .logs-link:hover { background: #eef2ff; color: #1f2937; }
+
+/* The Cast framework injects its own <cast-media-player> and renders the
+   default media UI in it — the banner that appeared across the bottom of the
+   TV on every pause. touchScreenOptimizedApp=false is not enough on its own
+   because the element is added whether or not we declare it. We drive
+   playback through our own <audio> via setMediaElement and draw our own
+   transcript UI, so the framework's player must never be visible. */
+cast-media-player {
+  display: none !important;
+  visibility: hidden !important;
+}

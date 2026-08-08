@@ -37,6 +37,11 @@ function makeElement(name, log) {
     paused: true,
     currentTime: 0,
     duration: 0,
+    // Media-readiness fields must be real values, not the Proxy's catch-all
+    // function: the reconciler defers snapping while `seeking` is truthy, and a
+    // function is truthy, which silently disabled every snap in these tests.
+    seeking: false,
+    readyState: 4,   // HAVE_ENOUGH_DATA — a loaded, settled element
     src: '',
     tabIndex: 0,
     addEventListener(type) {
@@ -424,6 +429,118 @@ test('reconciler ignores a receiver with no duration yet', async () => {
   assert.equal(audio.currentTime, 50, 'must not rewind against unloaded media');
 });
 
+// ── Snap thrash ──────────────────────────────────────────────────────────────
+//
+// Every snap seeks the local element; a seek forces a re-buffer; while it
+// re-buffers the local clock stalls and the receiver's does not, so the drift
+// comes straight back. Field logs showed this oscillating between 38.9s and
+// 40.0s, dragging the transcript and its lazy translations around with it.
+
+test('a second snap is refused inside the cooldown', async () => {
+  const remote = { currentTime: 100, duration: 500, isPaused: false };
+  const { sandbox, audio } = await loadCastingApp(remote, { time: 110, paused: false });
+  sandbox.reconcileLocalToRemote('first');
+  assert.equal(audio.currentTime, 100, 'first seek applies');
+
+  audio.currentTime = 110;           // drift immediately reappears
+  sandbox.reconcileLocalToRemote('second');
+  assert.equal(audio.currentTime, 110, 'a seek must not follow straight after another');
+});
+
+test('snapping resumes once the cooldown expires', async () => {
+  const remote = { currentTime: 100, duration: 500, isPaused: false };
+  const { sandbox, evalIn, audio } = await loadCastingApp(remote, { time: 110, paused: false });
+  sandbox.reconcileLocalToRemote('first');
+  audio.currentTime = 110;
+  evalIn('lastSnapAt = 0;');         // pretend the cooldown elapsed
+  sandbox.reconcileLocalToRemote('later');
+  assert.equal(audio.currentTime, 100, 'genuine drift is still corrected');
+});
+
+test('no snap while the element is seeking', async () => {
+  // Seeking mid-seek is what fed the loop: it re-seeks before the first seek
+  // has even settled.
+  const remote = { currentTime: 100, duration: 500, isPaused: false };
+  const { sandbox, audio } = await loadCastingApp(remote, { time: 110, paused: false });
+  audio.seeking = true;
+  sandbox.reconcileLocalToRemote('test');
+  assert.equal(audio.currentTime, 110, 'must wait for the in-flight seek');
+});
+
+test('no snap while the element is still buffering', async () => {
+  const remote = { currentTime: 100, duration: 500, isPaused: false };
+  const { sandbox, audio } = await loadCastingApp(remote, { time: 110, paused: false });
+  audio.readyState = 1;   // HAVE_METADATA — not enough to play through
+  sandbox.reconcileLocalToRemote('test');
+  assert.equal(audio.currentTime, 110, 'must wait for the buffer to fill');
+});
+
+// ── Drift correction policy ──────────────────────────────────────────────────
+//
+// Seeking empties the buffer, fires `waiting`, and makes the browser's native
+// audio widget flash between play and paused — the reported flicker. It is the
+// right tool only for a genuine jump.
+
+test('small drift while playing is nudged, not seeked', async () => {
+  const { sandbox } = await loadApp();
+  assert.equal(sandbox.driftCorrection(101, 100, false), 'nudge');
+  assert.equal(sandbox.driftCorrection(99, 100, false), 'nudge');
+});
+
+test('drift inside tolerance is left completely alone', async () => {
+  const { sandbox } = await loadApp();
+  assert.equal(sandbox.driftCorrection(100.3, 100, false), 'none');
+});
+
+test('a large jump is seeked', async () => {
+  // An episode change or a user seek — worth the re-buffer.
+  const { sandbox } = await loadApp();
+  assert.equal(sandbox.driftCorrection(150, 100, false), 'seek');
+});
+
+test('a paused element is always seeked, never nudged', async () => {
+  // playbackRate has no effect while paused, so nudging there would silently
+  // never converge — this is what the pause-overshoot fix depends on.
+  const { sandbox } = await loadApp();
+  assert.equal(sandbox.driftCorrection(101.5, 100, true), 'seek');
+});
+
+test('the nudge runs slow when ahead and fast when behind', async () => {
+  const { sandbox } = await loadApp();
+  assert.ok(sandbox.nudgeRateFor(101, 100) < 1, 'ahead of the receiver → slow down');
+  assert.ok(sandbox.nudgeRateFor(99, 100) > 1, 'behind the receiver → speed up');
+});
+
+test('nudging never touches currentTime', async () => {
+  // The whole point: no seek, so no re-buffer and no widget flicker.
+  const remote = { currentTime: 100, duration: 500, isPaused: false };
+  const { sandbox, audio } = await loadCastingApp(remote, { time: 101, paused: false });
+  sandbox.reconcileLocalToRemote('test');
+  assert.equal(audio.currentTime, 101, 'position must be untouched');
+  assert.ok(audio.playbackRate < 1, 'correction happens via playback rate');
+});
+
+test('playback rate returns to normal once aligned', async () => {
+  const remote = { currentTime: 100, duration: 500, isPaused: false };
+  const { sandbox, audio } = await loadCastingApp(remote, { time: 101, paused: false });
+  sandbox.reconcileLocalToRemote('drifted');
+  assert.ok(audio.playbackRate < 1);
+  audio.currentTime = 100;   // caught up
+  sandbox.reconcileLocalToRemote('aligned');
+  assert.equal(audio.playbackRate, 1, 'a nudge must not persist past convergence');
+});
+
+test('play state is held while a transport command is in flight', async () => {
+  // The user pauses, we send the command, and the very next poll must not see
+  // "remote still playing, local paused" and undo them.
+  const remote = { currentTime: 100, duration: 500, isPaused: false };
+  const { sandbox, evalIn, audio } = await loadCastingApp(remote, { time: 100, paused: true });
+  evalIn('remotePlayerController = { playOrPause() {} }; commandedLocalPaused = false;');
+  sandbox.mirrorLocalTransportToRemote();   // sends pause, opens the settle window
+  sandbox.reconcileLocalToRemote('poll');
+  assert.equal(audio.paused, true, 'the pause must survive until the receiver reports back');
+});
+
 // ── Receiver resume position ─────────────────────────────────────────────────
 //
 // The Cast framework's clock keeps advancing across a pause and it resumes from
@@ -469,56 +586,59 @@ test('a backward gap is corrected too', async () => {
 
 test('a user pause on the sender is forwarded to the receiver', async () => {
   const { sandbox } = await loadApp();
-  // local paused, remote playing, not an echo → forward.
+  // local paused, remote playing, reconciler last commanded PLAYING → user did it.
   assert.equal(sandbox.shouldMirrorTransport(true, false, false), true);
 });
 
 test('a user play on the sender is forwarded to the receiver', async () => {
   const { sandbox } = await loadApp();
-  assert.equal(sandbox.shouldMirrorTransport(false, true, false), true);
+  assert.equal(sandbox.shouldMirrorTransport(false, true, true), true);
 });
 
 test('the reconcilers own transport writes are not mirrored back', async () => {
-  // Without echo suppression the reconciler pausing the local element would
-  // bounce a command to the receiver, pausing playback the user never touched.
+  // Without this the reconciler pausing the local element would bounce a
+  // command to the receiver, pausing playback the user never touched.
   const { sandbox } = await loadApp();
   assert.equal(sandbox.shouldMirrorTransport(true, false, true), false);
-  assert.equal(sandbox.shouldMirrorTransport(false, true, true), false);
+  assert.equal(sandbox.shouldMirrorTransport(false, true, false), false);
 });
 
 test('nothing is mirrored when both ends already agree', async () => {
   // playOrPause() is a toggle — forwarding when states match would drive the
   // receiver into the wrong state rather than keeping it aligned.
   const { sandbox } = await loadApp();
-  assert.equal(sandbox.shouldMirrorTransport(false, false, false), false);
+  assert.equal(sandbox.shouldMirrorTransport(false, false, true), false);
   assert.equal(sandbox.shouldMirrorTransport(true, true, false), false);
 });
 
-test('markProgrammaticTransport suppresses the very next mirror', async () => {
+test('a user pause is recognised even right after the reconciler acted', async () => {
+  // The regression this replaced: echo suppression used a 250ms time window, so
+  // on a buffering Pi the reconciler had almost always just acted and real
+  // pauses were swallowed. Intent comparison has no timing component.
   const { sandbox, evalIn } = await loadApp();
   evalIn(`
     castSession = {};
     remotePlayerController = { playOrPause() { globalThis.__toggles = (globalThis.__toggles || 0) + 1; } };
     remotePlayer = { currentTime: 10, duration: 500, isPaused: false };
     globalThis.__toggles = 0;
+    commandedLocalPaused = false;
   `);
-  // audioEl is paused (stub default) while the remote plays — normally mirrored.
-  sandbox.markProgrammaticTransport();
-  sandbox.mirrorLocalTransportToRemote();
-  assert.equal(sandbox.__toggles, 0, 'a marked write must not reach the receiver');
+  sandbox.markProgrammaticTransport(false);   // reconciler acted this instant
+  sandbox.mirrorLocalTransportToRemote();     // audioEl stub is paused = user pause
+  assert.equal(sandbox.__toggles, 1, 'a real pause must still reach the receiver');
 });
 
-test('an unmarked local transport change does reach the receiver', async () => {
+test('the reconcilers own pause does not reach the receiver', async () => {
   const { sandbox, evalIn } = await loadApp();
   evalIn(`
     castSession = {};
     remotePlayerController = { playOrPause() { globalThis.__toggles = (globalThis.__toggles || 0) + 1; } };
     remotePlayer = { currentTime: 10, duration: 500, isPaused: false };
     globalThis.__toggles = 0;
-    lastProgrammaticTransportAt = 0;
+    commandedLocalPaused = true;
   `);
   sandbox.mirrorLocalTransportToRemote();
-  assert.equal(sandbox.__toggles, 1, 'user intent must reach the receiver');
+  assert.equal(sandbox.__toggles, 0);
 });
 
 test('mirroring is inert without a Cast session', async () => {
@@ -581,6 +701,83 @@ test('endEpisodeTransition is a no-op when none is active', async () => {
   const { sandbox } = await loadApp();
   sandbox.endEpisodeTransition('test');  // must not throw
   assert.equal(sandbox.isEpisodeTransitionActive(Date.now()), false);
+});
+
+// ── Cast handover ────────────────────────────────────────────────────────────
+//
+// Starting a cast is a handover, not a fork. The sender used to play on through
+// the token mint and LOAD round trip, ending up seconds ahead, and was then
+// dragged backwards when the receiver finally reported in.
+
+test('starting a cast parks the sender', async () => {
+  const { sandbox, getElement } = await loadApp();
+  const audio = getElement('audioPlayer');
+  audio.paused = false;
+  audio.currentTime = 250;
+  audio.pause = () => { audio.paused = true; };
+
+  sandbox.parkSenderForHandover('cast handover');
+
+  assert.equal(audio.paused, true, 'sender must stop so the position stays put');
+  assert.equal(audio.currentTime, 250, 'and must not move while parked');
+  assert.equal(sandbox.isEpisodeTransitionActive(Date.now()), true, 'sync stays suspended');
+});
+
+test('parking is idempotent when already paused', async () => {
+  const { sandbox, getElement } = await loadApp();
+  const audio = getElement('audioPlayer');
+  audio.paused = true;
+  audio.currentTime = 250;
+  sandbox.parkSenderForHandover('cast handover');
+  assert.equal(audio.currentTime, 250);
+});
+
+test('the parked sender is not resumed while the handover is in flight', async () => {
+  // setupCastSync kick-starts local playback; during a handover that would
+  // undo the park microseconds after it was applied.
+  const remote = { currentTime: 250, duration: 1800, isPaused: false };
+  const { sandbox, audio } = await loadCastingApp(remote, { time: 250, paused: true });
+  sandbox.parkSenderForHandover('cast handover');
+  sandbox.reconcileLocalToRemote('poll');
+  assert.equal(audio.paused, true, 'must stay parked until the receiver confirms');
+});
+
+test('the sender resumes once the receiver confirms the load', async () => {
+  const remote = { currentTime: 250, duration: 1800, isPaused: false };
+  const { sandbox, audio } = await loadCastingApp(remote, { time: 250, paused: true });
+  sandbox.parkSenderForHandover('cast handover');
+  sandbox.endEpisodeTransition('loadMedia ok');
+  sandbox.reconcileLocalToRemote('poll');
+  assert.equal(audio.paused, false, 'playback follows the receiver again');
+});
+
+test('a parked sender is aligned to the receiver before resuming', async () => {
+  // The receiver has moved on a little during the load; a paused element can
+  // only be corrected by seeking, so it must land exactly, not nudge.
+  const remote = { currentTime: 253, duration: 1800, isPaused: false };
+  const { sandbox, audio } = await loadCastingApp(remote, { time: 250, paused: true });
+  sandbox.parkSenderForHandover('cast handover');
+  sandbox.endEpisodeTransition('loadMedia ok');
+  sandbox.reconcileLocalToRemote('poll');
+  assert.equal(audio.currentTime, 253, 'handover lands on the receiver position');
+});
+
+test('nothing can resume a parked sender, whoever calls', async () => {
+  // The guard lives in _ensureLocalMutedPlayback rather than at one call site,
+  // so setupCastSync's kick-start (and any future caller) cannot undo a park.
+  const { sandbox, getElement } = await loadApp();
+  const audio = getElement('audioPlayer');
+  audio.src = 'episode.mp3';
+  audio.paused = true;
+  audio.play = () => { audio.paused = false; return Promise.resolve(); };
+
+  sandbox.parkSenderForHandover('cast handover');
+  sandbox._ensureLocalMutedPlayback();
+  assert.equal(audio.paused, true, 'the park must survive a direct resume call');
+
+  sandbox.endEpisodeTransition('loadMedia ok');
+  sandbox._ensureLocalMutedPlayback();
+  assert.equal(audio.paused, false, 'and normal resumption still works after');
 });
 
 // ── Log verbosity ────────────────────────────────────────────────────────────
