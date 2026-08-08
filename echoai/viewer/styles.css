@@ -691,3 +691,20 @@ body.receiver-mode #fsTranscript {
 .logs-table tr.log-warn .log-col-level { color: #b45309; }
 .logs-table tr.log-debug { color: #6b7280; }
 .logs-table tr.log-info .log-col-level { color: #1d4ed8; }
+
+/* Logs link in the main topbar. Hidden in receiver mode — a TV has no browser
+   chrome to navigate back with, and the Chromecast never loads /logs. */
+.topbar { position: relative; }
+.logs-link {
+  position: absolute;
+  top: 10px;
+  right: 16px;
+  font-size: 13px;
+  text-decoration: none;
+  color: #4b5563;
+  border: 1px solid #d7dce5;
+  border-radius: 4px;
+  padding: 3px 10px;
+  background: #fff;
+}
+.logs-link:hover { background: #eef2ff; color: #1f2937; }

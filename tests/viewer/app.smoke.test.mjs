@@ -423,3 +423,220 @@ test('reconciler ignores a receiver with no duration yet', async () => {
   sandbox.reconcileLocalToRemote('test');
   assert.equal(audio.currentTime, 50, 'must not rewind against unloaded media');
 });
+
+// ── Receiver resume position ─────────────────────────────────────────────────
+//
+// The Cast framework's clock keeps advancing across a pause and it resumes from
+// that, not from where the audio stopped. Field logs showed a pause at 39.16s
+// resuming at 40.78s, so the transcript ran ~1.6s ahead of the audio.
+
+test('resume is pulled back to the pinned pause position', async () => {
+  const { sandbox } = await loadApp();
+  // The exact numbers from the reported session.
+  assert.equal(sandbox.shouldRestorePausePosition(39.16, 40.78), true);
+});
+
+test('resume within tolerance is left alone', async () => {
+  const { sandbox } = await loadApp();
+  assert.equal(
+    sandbox.shouldRestorePausePosition(39.16, 39.3), false,
+    'a sub-tolerance gap is not worth a visible correction'
+  );
+});
+
+test('no pin means no correction', async () => {
+  const { sandbox } = await loadApp();
+  assert.equal(sandbox.shouldRestorePausePosition(null, 100), false);
+});
+
+test('a large gap is treated as a seek, not clock drift', async () => {
+  // The user seeking while paused must win — yanking them back would be worse
+  // than the drift this is here to fix.
+  const { sandbox } = await loadApp();
+  assert.equal(sandbox.shouldRestorePausePosition(39.16, 600), false);
+});
+
+test('a backward gap is corrected too', async () => {
+  const { sandbox } = await loadApp();
+  assert.equal(sandbox.shouldRestorePausePosition(40.78, 39.16), true);
+});
+
+// ── Bidirectional transport ──────────────────────────────────────────────────
+//
+// The reconciler alone makes the sender's native <audio> controls read-only
+// while casting: a manual pause is undone within 500ms because the reconciler
+// sees the receiver still playing. User intent has to travel the other way.
+
+test('a user pause on the sender is forwarded to the receiver', async () => {
+  const { sandbox } = await loadApp();
+  // local paused, remote playing, not an echo → forward.
+  assert.equal(sandbox.shouldMirrorTransport(true, false, false), true);
+});
+
+test('a user play on the sender is forwarded to the receiver', async () => {
+  const { sandbox } = await loadApp();
+  assert.equal(sandbox.shouldMirrorTransport(false, true, false), true);
+});
+
+test('the reconcilers own transport writes are not mirrored back', async () => {
+  // Without echo suppression the reconciler pausing the local element would
+  // bounce a command to the receiver, pausing playback the user never touched.
+  const { sandbox } = await loadApp();
+  assert.equal(sandbox.shouldMirrorTransport(true, false, true), false);
+  assert.equal(sandbox.shouldMirrorTransport(false, true, true), false);
+});
+
+test('nothing is mirrored when both ends already agree', async () => {
+  // playOrPause() is a toggle — forwarding when states match would drive the
+  // receiver into the wrong state rather than keeping it aligned.
+  const { sandbox } = await loadApp();
+  assert.equal(sandbox.shouldMirrorTransport(false, false, false), false);
+  assert.equal(sandbox.shouldMirrorTransport(true, true, false), false);
+});
+
+test('markProgrammaticTransport suppresses the very next mirror', async () => {
+  const { sandbox, evalIn } = await loadApp();
+  evalIn(`
+    castSession = {};
+    remotePlayerController = { playOrPause() { globalThis.__toggles = (globalThis.__toggles || 0) + 1; } };
+    remotePlayer = { currentTime: 10, duration: 500, isPaused: false };
+    globalThis.__toggles = 0;
+  `);
+  // audioEl is paused (stub default) while the remote plays — normally mirrored.
+  sandbox.markProgrammaticTransport();
+  sandbox.mirrorLocalTransportToRemote();
+  assert.equal(sandbox.__toggles, 0, 'a marked write must not reach the receiver');
+});
+
+test('an unmarked local transport change does reach the receiver', async () => {
+  const { sandbox, evalIn } = await loadApp();
+  evalIn(`
+    castSession = {};
+    remotePlayerController = { playOrPause() { globalThis.__toggles = (globalThis.__toggles || 0) + 1; } };
+    remotePlayer = { currentTime: 10, duration: 500, isPaused: false };
+    globalThis.__toggles = 0;
+    lastProgrammaticTransportAt = 0;
+  `);
+  sandbox.mirrorLocalTransportToRemote();
+  assert.equal(sandbox.__toggles, 1, 'user intent must reach the receiver');
+});
+
+test('mirroring is inert without a Cast session', async () => {
+  const { sandbox, evalIn } = await loadApp();
+  evalIn(`
+    castSession = null;
+    remotePlayerController = { playOrPause() { globalThis.__toggles = (globalThis.__toggles || 0) + 1; } };
+    remotePlayer = { currentTime: 10, duration: 500, isPaused: false };
+    globalThis.__toggles = 0;
+  `);
+  sandbox.mirrorLocalTransportToRemote();
+  assert.equal(sandbox.__toggles, 0);
+});
+
+// ── Episode transitions ──────────────────────────────────────────────────────
+//
+// Mid-changeover the two ends describe DIFFERENT media. Reconciling then took
+// the receiver's position in the OLD episode and applied it to the NEW one.
+
+test('reconciliation is suspended during an episode change', async () => {
+  // Receiver still reporting the old episode at 500s; sender already on the new
+  // one at 0s. Without the guard the new episode is yanked to 500s.
+  const remote = { currentTime: 500, duration: 1800, isPaused: false };
+  const { sandbox, audio } = await loadCastingApp(remote, { time: 0, paused: false });
+  sandbox.beginEpisodeTransition('test', true);
+  sandbox.reconcileLocalToRemote('test');
+  assert.equal(audio.currentTime, 0, 'must not drag the new episode to the old position');
+});
+
+test('reconciliation resumes once the transition ends', async () => {
+  const remote = { currentTime: 500, duration: 1800, isPaused: false };
+  const { sandbox, audio } = await loadCastingApp(remote, { time: 0, paused: false });
+  sandbox.beginEpisodeTransition('test', true);
+  sandbox.endEpisodeTransition('test');
+  sandbox.reconcileLocalToRemote('test');
+  assert.equal(audio.currentTime, 500, 'normal convergence must return');
+});
+
+test('a transition expires on its own so sync can never stay stuck', async () => {
+  const { sandbox, evalIn } = await loadApp();
+  sandbox.beginEpisodeTransition('test', true);
+  assert.equal(sandbox.isEpisodeTransitionActive(Date.now()), true);
+  // A lost loadMedia callback must not suspend sync forever.
+  evalIn('castTransitionUntil = Date.now() - 1;');
+  assert.equal(sandbox.isEpisodeTransitionActive(Date.now()), false);
+});
+
+test('ending a transition resets the remote clock tracker', async () => {
+  // The old episode's clock readings must not make the new one look stalled.
+  const { sandbox, evalIn } = await loadApp();
+  sandbox.beginEpisodeTransition('test', true);
+  evalIn('lastRemoteTime = 500;');
+  sandbox.endEpisodeTransition('test');
+  // Top-level `let` bindings are not sandbox properties — read them in-context.
+  assert.equal(evalIn('lastRemoteTime'), -1);
+  assert.equal(sandbox.remoteIsMoving(Date.now()), true, 'new media starts optimistic');
+});
+
+test('endEpisodeTransition is a no-op when none is active', async () => {
+  const { sandbox } = await loadApp();
+  sandbox.endEpisodeTransition('test');  // must not throw
+  assert.equal(sandbox.isEpisodeTransitionActive(Date.now()), false);
+});
+
+// ── Log verbosity ────────────────────────────────────────────────────────────
+//
+// Volume is bounded on two sides: the server caps client entries per minute and
+// the log file rotates within a few MB. Verbose traces must therefore stay off
+// unless asked for, or they evict the events worth keeping.
+
+test('debug traces are suppressed by default', async () => {
+  const { sandbox, evalIn } = await loadApp();
+  evalIn('castLogEntries.length = 0;');
+  sandbox.castLogDebug('a high-frequency trace');
+  assert.equal(evalIn('castLogEntries.length'), 0, 'DEBUG must not log without ?verbose=1');
+});
+
+test('debug traces are emitted with ?verbose=1', async () => {
+  const { sandbox, evalIn } = await loadApp('?verbose=1');
+  evalIn('castLogEntries.length = 0;');
+  sandbox.castLogDebug('a high-frequency trace');
+  assert.equal(evalIn('castLogEntries.length'), 1);
+  assert.equal(evalIn('castLogEntries[0].level'), 'DEBUG');
+});
+
+test('normal logs are never suppressed', async () => {
+  // State changes and decisions must survive without verbose mode.
+  const { sandbox, evalIn } = await loadApp();
+  evalIn('castLogEntries.length = 0;');
+  sandbox.castLog('INFO', 'a state change');
+  assert.equal(evalIn('castLogEntries.length'), 1);
+});
+
+test('the heartbeat reports sender state without a cast session', async () => {
+  const { sandbox, evalIn } = await loadApp();
+  evalIn('castLogEntries.length = 0; castSession = null;');
+  sandbox.logSyncHeartbeat();
+  const msg = evalIn('castLogEntries[0].msg');
+  assert.match(msg, /^hb sender:/);
+  assert.match(msg, /casting=no/);
+});
+
+test('the heartbeat reports drift and transition state while casting', async () => {
+  // This one line is what makes a desync reconstructable after the fact.
+  const { sandbox, evalIn } = await loadCastingApp(
+    { currentTime: 100, duration: 500, isPaused: false }, { time: 102, paused: false }
+  );
+  evalIn('castLogEntries.length = 0;');
+  sandbox.logSyncHeartbeat();
+  const msg = evalIn('castLogEntries[0].msg');
+  assert.match(msg, /casting=yes/);
+  assert.match(msg, /drift=2\.00s/);
+  assert.match(msg, /transition=/);
+});
+
+test('the heartbeat never throws in receiver mode', async () => {
+  const { sandbox, evalIn } = await loadApp('?mode=receiver');
+  evalIn('castLogEntries.length = 0;');
+  sandbox.logSyncHeartbeat();
+  assert.match(evalIn('castLogEntries[0].msg'), /^hb receiver:/);
+});

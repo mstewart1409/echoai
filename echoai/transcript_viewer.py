@@ -86,9 +86,13 @@ LOG_API_DEFAULT_LINES = 500
 CLIENT_LOG_MAX_ENTRIES = 50
 CLIENT_LOG_MAX_MSG_LEN = 1000
 CLIENT_LOG_LEVELS = frozenset({'DEBUG', 'INFO', 'OK', 'WARN', 'ERROR'})
+# Client-supplied wall-clock stamp, e.g. "17:00:02.884". Kept short and strictly
+# validated: it is display-only context, never parsed or trusted for ordering.
+CLIENT_LOG_TS_RE = re.compile(r'^\d{2}:\d{2}:\d{2}[.,]\d{1,3}$')
 # Flood ceiling: a client that spams logs would rotate real evidence out of the
-# file. Generous enough for genuine debugging, low enough to bound the damage.
-CLIENT_LOG_RATE_MAX_ENTRIES = 600
+# file. Sized for two clients (sender + receiver) running verbose tracing with
+# headroom, while still bounding the damage from a runaway loop.
+CLIENT_LOG_RATE_MAX_ENTRIES = 1200
 CLIENT_LOG_RATE_WINDOW_SECONDS = 60
 
 # Largest request body accepted on ANY endpoint. Without this a single huge
@@ -1280,6 +1284,19 @@ def api_episode(episode_id: str):
         payload['transcript_type'] = 'txt'
         payload['text'] = txt_path.read_text(encoding='utf-8', errors='ignore')
 
+    # What the client actually received. When the viewer shows a stale or empty
+    # transcript this is the line that says whether the server had anything to
+    # give it — 'none' here means no transcript file exists for the episode.
+    logger.info(
+        'episode %s served — type=%s segments=%d words=%d',
+        safe_id,
+        payload['transcript_type'],
+        len(payload['segments']),
+        len(payload['words']),
+    )
+    if payload['transcript_type'] == 'none':
+        logger.warning('episode %s has no transcript file (checked json/srt/txt)', safe_id)
+
     return jsonify(payload)
 
 
@@ -1540,9 +1557,14 @@ def api_logs_client():
         message = sanitize_log_text(str(entry.get('msg', ''))[:CLIENT_LOG_MAX_MSG_LEN]).strip()
         if not message:
             continue
+        # The client's own clock, when it is exactly the shape we expect. A
+        # batched flush otherwise stamps every line with the same ingest time,
+        # which hides the very timing detail these logs exist to show.
+        client_ts = str(entry.get('ts', ''))[:16]
+        prefix = f'[{source} {client_ts}]' if CLIENT_LOG_TS_RE.match(client_ts) else f'[{source}]'
         # OK is a client-only level with no logging equivalent; it maps to INFO.
         client_logger.log(
-            _CLIENT_LEVEL_TO_LOGGING.get(level, logging.INFO), '[%s] %s', source, message
+            _CLIENT_LEVEL_TO_LOGGING.get(level, logging.INFO), '%s %s', prefix, message
         )
         accepted += 1
     return jsonify({'accepted': accepted})

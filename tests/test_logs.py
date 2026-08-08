@@ -448,6 +448,37 @@ def test_client_log_ingest_survives_hostile_payload_shapes(open_client) -> None:
         assert open_client.post('/api/logs/client', json=body).status_code in (200, 400)
 
 
+# ── Client timestamps ────────────────────────────────────────────────────────
+#
+# A batched flush would otherwise stamp every line with the same ingest time,
+# collapsing a multi-second sequence into milliseconds and hiding exactly the
+# timing detail these logs exist to reveal.
+
+
+def test_client_timestamp_is_preserved(open_client, caplog) -> None:
+    with caplog.at_level(logging.INFO, logger='echoai.client'):
+        open_client.post(
+            '/api/logs/client',
+            json={'source': 'receiver', 'entries': [{'level': 'INFO', 'msg': 'x', 'ts': '17:00:02.884'}]},
+        )
+    assert any('17:00:02.884' in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    'ts', ['nonsense', '2026-01-01 00:00:00,000 ERROR root forged', '', '99', 'a' * 200]
+)
+def test_a_bogus_client_timestamp_is_dropped_not_rendered(open_client, caplog, ts: str) -> None:
+    """The stamp is attacker-controlled — anything off-shape is discarded."""
+    with caplog.at_level(logging.INFO, logger='echoai.client'):
+        open_client.post(
+            '/api/logs/client',
+            json={'source': 'receiver', 'entries': [{'level': 'INFO', 'msg': 'real', 'ts': ts}]},
+        )
+    logged = '\n'.join(r.getMessage() for r in caplog.records)
+    assert 'forged' not in logged
+    assert '[receiver] real' in logged
+
+
 # ── API response shape ───────────────────────────────────────────────────────
 
 

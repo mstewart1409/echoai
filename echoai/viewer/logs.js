@@ -12,6 +12,7 @@ const searchEl = document.getElementById("logSearch");
 const sourceEl = document.getElementById("logSource");
 const levelsEl = document.getElementById("logLevels");
 const limitEl = document.getElementById("logLimit");
+const quickFilterEl = document.getElementById("logQuickFilter");
 const autoRefreshEl = document.getElementById("logAutoRefresh");
 const refreshBtnEl = document.getElementById("logRefreshBtn");
 const copyBtnEl = document.getElementById("logCopyBtn");
@@ -149,6 +150,15 @@ limitEl.addEventListener("change", () => void fetchLogs());
 levelsEl.addEventListener("change", () => void fetchLogs());
 refreshBtnEl.addEventListener("click", () => void fetchLogs());
 autoRefreshEl.addEventListener("change", applyAutoRefresh);
+
+// Quick filters just prefill the search box — the server does the matching, and
+// leaving the text visible means it can be edited rather than fought with.
+if (quickFilterEl) {
+  quickFilterEl.addEventListener("change", () => {
+    searchEl.value = quickFilterEl.value;
+    void fetchLogs();
+  });
+}
 
 copyBtnEl.addEventListener("click", () => {
   const text = lastRecords

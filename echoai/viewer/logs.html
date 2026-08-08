@@ -31,6 +31,16 @@
         <label><input type="checkbox" value="CRITICAL" checked> CRIT</label>
       </span>
 
+      <select id="logQuickFilter" title="Jump to a common investigation">
+        <option value="">Quick filter…</option>
+        <option value="hb ">Heartbeats (state over time)</option>
+        <option value="sync[">Sync decisions</option>
+        <option value="transport:">Transport (play/pause)</option>
+        <option value="episode">Episode changes</option>
+        <option value="receiver ">Receiver playback events</option>
+        <option value="auth">Auth</option>
+      </select>
+
       <select id="logLimit">
         <option value="200">200 lines</option>
         <option value="500" selected>500 lines</option>
