@@ -1,3 +1,9 @@
+## 0.16.0 (2026-08-08)
+
+### Feat
+
+- implement cast handover logic to park sender during episode transitions and enhance drift correction mechanisms
+
 ## 0.15.0 (2026-08-08)
 
 ### Feat

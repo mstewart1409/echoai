@@ -1,6 +1,6 @@
 [project]
 name = "echoai"
-version = "0.15.0"
+version = "0.16.0"
 description = ""
 authors = [{ name = "Michael Stewart", email = "m.n.stewart@live.co.uk" }]
 readme = "README.md"
@@ -74,7 +74,7 @@ quote-style = "single"
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.15.0"
+version = "0.16.0"
 version_files = [
     "echoai/__init__.py:__version__",
     "pyproject.toml:^version"
