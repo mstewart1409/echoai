@@ -1,3 +1,9 @@
+## 0.14.0 (2026-08-08)
+
+### Feat
+
+- add log viewer page and enhance logging functionality for better debugging
+
 ## 0.13.0 (2026-08-07)
 
 ### Feat
