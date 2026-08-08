@@ -53,7 +53,10 @@ def test_cast_token_rejects_tampered_signature() -> None:
 
 def test_cast_token_rejects_expired(monkeypatch) -> None:
     token, _ = tv._mint_cast_token('123_ep')
-    future = time.time() + 10_000
+    # Derived from the configured TTL, not a fixed offset: this test silently
+    # stopped testing anything when CAST_TOKEN_TTL_SECONDS was raised to 10800
+    # and the hardcoded +10_000 landed inside the validity window.
+    future = time.time() + tv.CAST_TOKEN_TTL_SECONDS + 60
     monkeypatch.setattr(tv.time, 'time', lambda: future)
     assert tv._verify_cast_token(token) is None
 

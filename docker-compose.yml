@@ -25,7 +25,11 @@ services:
       - ./transcripts:/app/transcripts:ro
     read_only: true
     tmpfs:
-      - /tmp
+      # Sized explicitly: tmpfs is RAM, and it counts against mem_limit below.
+      # An unbounded /tmp lets a runaway writer (the app log, a temp file) eat
+      # the whole 512 MB budget and OOM the container. 64 MB comfortably holds
+      # the ~8 MB rotating log set with room to spare.
+      - /tmp:size=64m,mode=1777
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -33,6 +37,14 @@ services:
     pids_limit: 100
     mem_limit: 512m
     memswap_limit: 512m
+    # Docker's json-file driver is UNBOUNDED by default — on a Pi that quietly
+    # fills the SD card. The app already writes its own rotating log to /tmp
+    # for the /logs page; this caps what Docker keeps for `docker compose logs`.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
 
@@ -52,3 +64,8 @@ services:
   #     WATCHTOWER_LOG_LEVEL: info
   #     DOCKER_CONFIG: /
   #     WATCHTOWER_HTTP_API_METRICS: "false"
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "3"

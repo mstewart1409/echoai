@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>echoai — Logs</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="logs-body">
+  <header class="logs-header">
+    <div class="logs-title">
+      <a href="/" class="logs-back" title="Back to the viewer">&larr;</a>
+      <h1>Logs</h1>
+      <span id="logMeta" class="logs-meta"></span>
+    </div>
+
+    <div class="logs-filters">
+      <input id="logSearch" type="search" placeholder="Search message text…" autocomplete="off">
+
+      <select id="logSource">
+        <option value="">All sources</option>
+        <option value="echoai.server">Server</option>
+        <option value="echoai.client">Client / Chromecast</option>
+      </select>
+
+      <span class="logs-levels" id="logLevels">
+        <label><input type="checkbox" value="DEBUG"> DEBUG</label>
+        <label><input type="checkbox" value="INFO" checked> INFO</label>
+        <label><input type="checkbox" value="WARNING" checked> WARN</label>
+        <label><input type="checkbox" value="ERROR" checked> ERROR</label>
+        <label><input type="checkbox" value="CRITICAL" checked> CRIT</label>
+      </span>
+
+      <select id="logLimit">
+        <option value="200">200 lines</option>
+        <option value="500" selected>500 lines</option>
+        <option value="1000">1000 lines</option>
+        <option value="2000">2000 lines</option>
+      </select>
+
+      <label class="logs-auto">
+        <input id="logAutoRefresh" type="checkbox"> Auto-refresh
+      </label>
+
+      <button id="logRefreshBtn" type="button">Refresh</button>
+      <button id="logCopyBtn" type="button">Copy</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="logStatus" class="logs-status">Loading…</div>
+    <table class="logs-table">
+      <thead>
+        <tr><th>Time</th><th>Level</th><th>Source</th><th>Message</th></tr>
+      </thead>
+      <tbody id="logRows"></tbody>
+    </table>
+  </main>
+
+  <script src="/static/logs.js"></script>
+</body>
+</html>

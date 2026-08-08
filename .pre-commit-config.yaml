@@ -56,3 +56,11 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-commit]
+
+      - id: uv-audit
+        name: uv audit
+        entry: uv audit --preview-features audit-command
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]

@@ -38,22 +38,39 @@
 //   Approach: the sender plays its own muted copy of the audio.  Its native
 //   `timeupdate` event (fired by the browser's media pipeline) drives all
 //   transcript highlighting — no polling of remotePlayer.currentTime for UI.
-//   A 500ms drift-correction interval snaps the muted local audio to the
-//   receiver's reported position when they diverge by more than 0.5s.
 //
 //   WHY NOT just poll remotePlayer.currentTime?
 //   - RemotePlayer updates are asynchronous and coarse (~1s granularity).
 //   - Using it directly for transcript tracking produces jerky, delayed updates.
 //   - The local muted audio gives smooth, browser-native timeupdate (~4Hz).
 //
-//   SYNC EVENTS (sender side, in setupCastSync):
-//   - IS_PAUSED_CHANGED: mirrors pause/play to local audioEl.
-//     · On PAUSE: just pause local audio in place (don't snap time — avoids
-//       visible backward jump from Cast event latency).
-//     · On PLAY: resume local muted playback; drift correction aligns in 500ms.
-//   - CURRENT_TIME_CHANGED: snaps local time on large drifts (>0.5s playing,
-//     >2s paused) to catch deliberate seeks without causing flicker loops.
-//   - 500ms setInterval: drift correction + autoplay-policy recovery.
+//   ONE RECONCILER, MANY TRIGGERS (sender side):
+//   reconcileLocalToRemote() is the ONLY function permitted to write
+//   audioEl.currentTime or change audioEl's play state while casting.  Three
+//   triggers call it and do nothing else themselves:
+//     · IS_PAUSED_CHANGED   — the receiver started or stopped
+//     · CURRENT_TIME_CHANGED — the receiver reported a position
+//     · 500ms poll           — catches anything the events missed
+//   _seekTo() is the one exception, and deliberately so: a seek is a user
+//   COMMAND that drives both clocks to a chosen position, not a convergence.
+//
+//   Every sync bug in this file's history came from two handlers each holding
+//   their own half of the policy and fighting: one resurrecting local playback
+//   while another snapped it back, or a pause path that skipped correction and
+//   left the local element seconds ahead.  Keep the policy in the reconciler.
+//   If a new trigger is needed, call the reconciler from it — do not touch
+//   audioEl directly.
+//
+//   Reconciler policy:
+//   - Position: converge on the receiver past CAST_DRIFT_TOLERANCE_SEC, whether
+//     playing or paused.  Correcting while paused is free (the element is
+//     stationary, so it snaps once) and prevents a paused-ahead local element
+//     from resuming out of sync.
+//   - Play state: follow the receiver, believing its CLOCK over its FLAG.
+//     remotePlayer.isPaused reads false in cases where the receiver is really
+//     stopped; a clock that hasn't moved for CAST_STALL_TIMEOUT_MS is stopped.
+//     Explicit transitions (play/pause/seek) reset that window via
+//     resetRemoteClockGrace() so a fresh resume isn't misread as a stall.
 //
 // ── EPISODE LOADING ON RECEIVER ─────────────────────────────────────────────
 //
@@ -143,6 +160,65 @@ let castDebugPanelEl = null;          // Root DOM element of the debug panel (cr
 let castDebugPanelBodyEl = null;      // Scrollable body div inside the debug panel
 
 let castDebugFullscreen = false;      // Whether the debug panel is currently shown fullscreen
+
+// ── Server log shipping ──────────────────────────────────────────────────────
+// castLog() entries are batched and POSTed to /api/logs/client so they land in
+// the Pi's log file alongside server logs and are viewable at /logs. This is
+// the only way to see what the Chromecast receiver did — a TV has no DevTools.
+//
+// Bounded on purpose: a flush is capped at the server's per-request limit, the
+// pending queue is capped so a server outage can't grow it without limit, and
+// failures are swallowed. Logging must never break playback or recurse.
+const LOG_SHIP_INTERVAL_MS = 3000;    // Batch window — keeps requests off the hot path
+const LOG_SHIP_MAX_BATCH = 50;        // Must not exceed the server's CLIENT_LOG_MAX_ENTRIES
+const LOG_SHIP_MAX_PENDING = 200;     // Queue ceiling while the server is unreachable
+let logShipQueue = [];
+let logShipTimer = null;
+let logShipInFlight = false;
+
+/** Queue one entry for the next flush. Never throws — callers are log calls. */
+function shipLogEntry(level, msg) {
+  logShipQueue.push({ level, msg });
+  if (logShipQueue.length > LOG_SHIP_MAX_PENDING) {
+    logShipQueue = logShipQueue.slice(-LOG_SHIP_MAX_PENDING);
+  }
+  if (!logShipTimer) {
+    logShipTimer = setTimeout(flushLogQueue, LOG_SHIP_INTERVAL_MS);
+  }
+}
+
+/**
+ * POST one batch. Drops the batch on failure rather than retrying — a retry
+ * loop against a down server is exactly the kind of unbounded work this file
+ * must not do, and losing debug lines is cheaper than wedging the UI.
+ */
+async function flushLogQueue() {
+  logShipTimer = null;
+  if (logShipInFlight || !logShipQueue.length) return;
+
+  const batch = logShipQueue.splice(0, LOG_SHIP_MAX_BATCH);
+  logShipInFlight = true;
+  try {
+    const headers = { "Content-Type": "application/json" };
+    // The receiver has no cookies — it authenticates with its cast token.
+    if (receiverAuthToken) headers["X-Cast-Token"] = receiverAuthToken;
+    await fetch("/api/logs/client", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        source: receiverMode ? "receiver" : "sender",
+        entries: batch,
+      }),
+    });
+  } catch {
+    // Deliberately silent: console.* here would recurse through castLog().
+  } finally {
+    logShipInFlight = false;
+    if (logShipQueue.length) {
+      logShipTimer = setTimeout(flushLogQueue, LOG_SHIP_INTERVAL_MS);
+    }
+  }
+}
 
 /**
  * Lazily create the on-screen debug panel DOM.  Called on first castLog() when
@@ -279,6 +355,10 @@ function castLog(level, ...args) {
   castLogEntries.push({ ts, level, msg });
   if (castLogEntries.length > CAST_LOG_MAX) castLogEntries.shift();
 
+  // Ship to the server so Chromecast-side failures are diagnosable at /logs —
+  // the receiver runs on a TV with no DevTools and no way to read its console.
+  shipLogEntry(level, msg);
+
   // If the on-screen debug panel is active, render the entry there too.
   if (castDebugEnabled || castDebugFullscreen) {
     _ensureCastDebugPanel();
@@ -350,9 +430,9 @@ function _isCasting() {
 }
 
 /**
- * Seek to a time position.  When casting, seek both:
- * 1. The local (muted) audioEl — drives transcript tracking via timeupdate.
- * 2. The Chromecast receiver — via remotePlayerController.seek().
+ * Seek to a time position. This is a COMMAND, not reconciliation: the user
+ * chose this position, so we drive both clocks to it rather than converging
+ * one on the other. reconcileLocalToRemote() takes over again afterwards.
  *
  * On the receiver, _isCasting() is false, so only audioEl is seeked directly.
  * The Cast framework (which owns audioEl via setMediaElement) then reports the
@@ -372,13 +452,14 @@ function _seekTo(time, autoPlay = true) {
     castLog("INFO", "_seekTo → Chromecast:", time.toFixed(1), "s, autoPlay:", autoPlay);
     remotePlayer.currentTime = time;
     remotePlayerController.seek();
-    // When the user clicks a segment to play from that position, also resume
-    // the remote if it was paused — otherwise the local muted audio advances
-    // while the remote stays still, and the 500ms drift correction keeps snapping
-    // the local position back, creating a janky loop.
+    // Resume the remote too, or the local element advances against a stopped
+    // receiver and the reconciler drags it back every cycle.
     if (autoPlay && remotePlayer.isPaused) {
       remotePlayerController.playOrPause();
     }
+    // The seek is authoritative — don't let the pre-seek clock reading make
+    // the receiver look stalled while its media status catches up.
+    resetRemoteClockGrace(Date.now());
   }
 }
 
@@ -648,90 +729,149 @@ async function loadCurrentEpisodeOnCastSession(session, startTime = 0) {
   );
 }
 
-// ── Bidirectional Cast sync helpers ──────────────────────────────────────────
+// ── Cast sync: local/remote clock reconciliation (sender side) ───────────────
+//
+// See "ONE RECONCILER, MANY TRIGGERS" in the file header before editing.
+// reconcileLocalToRemote() owns audioEl's clock and play state while casting;
+// new sync triggers call it rather than touching audioEl themselves.
+
+/**
+ * Max tolerated gap between the local muted audioEl and the receiver, in seconds.
+ * Below this the transcript highlight is visually indistinguishable from correct;
+ * above it, snap. Applies whether the remote is playing or paused.
+ */
+const CAST_DRIFT_TOLERANCE_SEC = 0.5;
+
+/** How often the sender polls the receiver's clock. */
+const CAST_SYNC_INTERVAL_MS = 500;
+
+/**
+ * How long the receiver's clock may sit still before we call it stopped.
+ * Three poll cycles — long enough to survive one dropped media status,
+ * short enough that a stuck receiver can't drag the local element with it.
+ */
+const CAST_STALL_TIMEOUT_MS = 1500;
+
+// Movement tracker for the receiver's clock. remotePlayer.isPaused is trusted
+// when true, but it reads false in cases where the receiver is genuinely
+// stopped, so we corroborate it with "has the clock actually moved lately".
+let lastRemoteTime = -1;
+let lastRemoteMoveAt = 0;
+
+function castShouldSnap(localTime, remoteTime) {
+  return Math.abs(localTime - remoteTime) > CAST_DRIFT_TOLERANCE_SEC;
+}
+
+/**
+ * Record the receiver's clock position. Extends the movement window whenever
+ * the clock advances; call on every sync trigger.
+ */
+function noteRemoteClock(remoteTime, now) {
+  if (remoteTime !== lastRemoteTime) {
+    lastRemoteTime = remoteTime;
+    lastRemoteMoveAt = now;
+  }
+}
+
+/**
+ * Give the clock a fresh grace window. Called on an explicit state change
+ * (session start, play/pause) so that the moment after a resume — flag says
+ * playing, clock hasn't ticked yet — is read as playing rather than stalled.
+ */
+function resetRemoteClockGrace(now) {
+  lastRemoteMoveAt = now;
+}
+
+/** Is the receiver actually advancing, per its clock rather than its flag? */
+function remoteIsMoving(now) {
+  return now - lastRemoteMoveAt < CAST_STALL_TIMEOUT_MS;
+}
+
+/**
+ * THE single owner of local/remote playback reconciliation.
+ *
+ * Nothing else may write audioEl.currentTime or toggle audioEl play state while
+ * casting. Every sync trigger (pause events, time events, the poll interval)
+ * funnels here, so there is exactly one place where the policy lives and
+ * exactly one place a sync regression can hide.
+ *
+ * Policy:
+ * - Position: converge on the receiver whenever drift exceeds tolerance,
+ *   playing OR paused. Correcting while paused is free — the element is
+ *   stationary, so it snaps once and settles rather than flickering — and it
+ *   is what stops a paused-ahead local element from resuming out of sync.
+ * - Play state: follow the receiver, believing its clock over its flag.
+ *
+ * @param {string} reason - Trigger name, for the debug log only.
+ */
+function reconcileLocalToRemote(reason) {
+  if (receiverMode || !_isCasting()) return;
+  if (!remotePlayer || remotePlayer.duration <= 0) return;
+
+  const now = Date.now();
+  const remoteTime = remotePlayer.currentTime;
+  noteRemoteClock(remoteTime, now);
+
+  if (castShouldSnap(audioEl.currentTime, remoteTime)) {
+    const drift = audioEl.currentTime - remoteTime;
+    castLog("INFO", `sync[${reason}]: snap ${drift.toFixed(1)}s → ${remoteTime.toFixed(1)}s`);
+    audioEl.currentTime = remoteTime;
+  }
+
+  const shouldPlay = !remotePlayer.isPaused && remoteIsMoving(now);
+  if (shouldPlay && audioEl.paused) {
+    castLog("INFO", `sync[${reason}]: resuming local muted playback`);
+    _ensureLocalMutedPlayback();
+  } else if (!shouldPlay && !audioEl.paused) {
+    castLog("INFO", `sync[${reason}]: pausing local (remote stopped)`);
+    audioEl.pause();
+  }
+}
 
 /**
  * Set up RemotePlayer + RemotePlayerController so the sender tracks receiver
- * media state (play/pause, seek).  Also listens for custom namespace messages
- * (episode changes) from the receiver.
+ * media state, wire the reconciler's triggers, and listen for custom namespace
+ * messages (episode changes) from the receiver.
  */
 function setupCastSync(session) {
   teardownCastSync();
-
   if (!window.cast || !window.cast.framework) return;
 
   remotePlayer = new cast.framework.RemotePlayer();
   remotePlayerController = new cast.framework.RemotePlayerController(remotePlayer);
   castLog("INFO", "RemotePlayer + Controller created");
 
+  // Start optimistic: assume the receiver is live until its clock proves
+  // otherwise, so the grace window doesn't suppress the initial playback.
+  lastRemoteTime = -1;
+  resetRemoteClockGrace(Date.now());
+
   // Kick-start local muted playback so the sender UI tracks position from
-  // the moment casting begins — don't wait for IS_PAUSED_CHANGED which may
-  // not fire until the Chromecast finishes loading media.
+  // the moment casting begins — don't wait for the first reconcile, which
+  // needs a non-zero remote duration and may be one media-status away.
   _ensureLocalMutedPlayback();
 
-  // Mirror remote play/pause to local audioEl — the local element plays muted
-  // so its timeupdate event drives transcript tracking naturally.
+  // Every trigger below does the same thing: report to the reconciler.
   remotePlayerController.addEventListener(
     cast.framework.RemotePlayerEventType.IS_PAUSED_CHANGED,
     () => {
       castLog("INFO", "remote IS_PAUSED_CHANGED — paused:", remotePlayer.isPaused);
-      if (remotePlayer.isPaused) {
-        // Just pause — don't snap audioEl.currentTime.  The local audio
-        // will be at most ~0.5s ahead (the Cast event latency).  Snapping
-        // back causes a visible transcript jump.  The drift correction
-        // will re-align when playback resumes.
-        audioEl.pause();
-      } else {
-        // Resume local muted playback.  Don't snap audioEl.currentTime here —
-        // remotePlayer.currentTime often still reports the stale paused value
-        // at this moment, which causes the transcript to hang at the old
-        // position then skip forward once CURRENT_TIME_CHANGED catches up.
-        // The drift correction interval will align within ~500ms.
-        _ensureLocalMutedPlayback();
-      }
+      // An explicit transition is trustworthy — restart the grace window so a
+      // resume isn't misread as a stall in the moment before the clock ticks.
+      resetRemoteClockGrace(Date.now());
+      reconcileLocalToRemote("pause-changed");
     }
   );
 
-  // On discrete receiver-side seeks, snap local audioEl to match.
-  // When paused, only snap on large jumps (>2s) to catch deliberate seeks
-  // while avoiding the flicker loop from repeated small snaps.
   remotePlayerController.addEventListener(
     cast.framework.RemotePlayerEventType.CURRENT_TIME_CHANGED,
-    () => {
-      if (remotePlayer.duration <= 0) return;
-      const drift = Math.abs(audioEl.currentTime - remotePlayer.currentTime);
-      if (remotePlayer.isPaused) {
-        // Large jump while paused = deliberate seek on receiver.
-        if (drift > 2) {
-          audioEl.currentTime = remotePlayer.currentTime;
-        }
-        return;
-      }
-      if (drift > 0.5) {
-        audioEl.currentTime = remotePlayer.currentTime;
-      }
-    }
+    () => reconcileLocalToRemote("time-changed")
   );
 
-  // Lightweight drift correction — the local muted audioEl may drift slightly
-  // from the receiver over time.  Every 500ms, snap it back if drift exceeds 0.5s.
-  // Only corrects while the remote is playing to avoid flicker when paused.
-  // Also recovers from the edge case where local playback was rejected the
-  // first time (e.g. browser autoplay policy) — retries play() each cycle.
-  castTimeSyncInterval = setInterval(() => {
-    if (!_isCasting()) return;
-    if (remotePlayer.isPaused) return;
-    // If remote is playing but local is paused, restart local muted playback.
-    if (audioEl.paused) {
-      castLog("INFO", "drift interval: remote playing but local paused — restarting");
-      _ensureLocalMutedPlayback();
-    }
-    const drift = Math.abs(audioEl.currentTime - remotePlayer.currentTime);
-    if (drift > 0.5 && remotePlayer.duration > 0) {
-      castLog("INFO", "drift correction:", drift.toFixed(1), "s");
-      audioEl.currentTime = remotePlayer.currentTime;
-    }
-  }, 500);
+  castTimeSyncInterval = setInterval(
+    () => reconcileLocalToRemote("poll"),
+    CAST_SYNC_INTERVAL_MS
+  );
 
   // The receiver can vanish without a clean SESSION_ENDED (app crash, device
   // reboot, network drop). Without this the sender keeps a dead castSession,
@@ -796,6 +936,10 @@ function teardownCastSync() {
   }
   remotePlayer = null;
   remotePlayerController = null;
+  // Reset the clock tracker — a later session must not inherit this one's
+  // movement window and mistake a cold receiver for a live one.
+  lastRemoteTime = -1;
+  lastRemoteMoveAt = 0;
   castLog("INFO", "Cast sync torn down");
 }
 
@@ -2147,6 +2291,23 @@ function togglePlayPause() {
   // remotePlayerController.playOrPause() to keep sender and receiver in sync.
   castLog("INFO", "togglePlayPause — paused:", audioEl.paused,
     "src:", audioEl.src ? "set" : "empty", "readyState:", audioEl.readyState);
+
+  // On the receiver, go through the PlayerManager rather than poking audioEl.
+  // A raw audioEl.pause() stops the sound but does not always push a PAUSED
+  // media status to senders, so the sender's remotePlayer.isPaused stays false.
+  // Its 500ms drift interval then sees "remote playing, local paused",
+  // restarts local playback, and half a second later snaps it back to the
+  // receiver's frozen time — replaying the same ~1s of audio and transcript
+  // forever. PlayerManager.play/pause broadcast the state change properly.
+  if (receiverMode && receiverPlayerManager) {
+    if (audioEl.paused) {
+      receiverPlayerManager.play();
+    } else {
+      receiverPlayerManager.pause();
+    }
+    return;
+  }
+
   if (audioEl.paused) {
     const p = audioEl.play();
     if (p && p.catch) {

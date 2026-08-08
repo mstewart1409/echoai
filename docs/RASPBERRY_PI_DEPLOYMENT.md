@@ -1,152 +1,330 @@
 # Raspberry Pi Production Deployment
 
-## Goal
-Deploy the transcript viewer as a production Docker service on Raspberry Pi using the published image and Watchtower auto-updates.
+Deploy the transcript viewer as a Docker service on a Raspberry Pi. Watchtower
+auto-updates it when a new image is published to GHCR. All operations are done
+from a Windows machine over SSH.
 
-## 1) Prerequisites
-- Raspberry Pi OS with Docker + Docker Compose plugin installed.
-- A GitHub Personal Access Token (PAT) with `read:packages` scope.
-- This project's `docker-compose.yml` copied to the Pi.
+The Pi lives at `raspberrypi.local` (mDNS) or a static LAN IP; the app runs
+under `/home/pi/echoai`. Public access goes through Cloudflare Tunnel — the
+container itself only binds to `127.0.0.1:5000`.
 
-## 2) Configure Pi host paths
-Your `docker-compose.yml` expects:
-- `/home/pi/.docker/config.json` for GHCR auth (Watchtower)
-- project folder with:
-  - `./downloads`
-  - `./transcripts`
-  - `./.env`
+---
 
-Create the data folders on the Pi:
-```bash
-mkdir -p /home/pi/echoai/downloads /home/pi/echoai/transcripts
+## 1) One-time Windows setup
+
+### 1.1 Install an SSH client
+Windows 10/11 ships with OpenSSH. Verify:
+```powershell
+ssh -V
+```
+If missing: `Settings → Apps → Optional features → Add → OpenSSH Client`.
+
+### 1.2 Generate an SSH key (skip if you already have one)
+```powershell
+ssh-keygen -t ed25519 -C "windows-to-pi"
+# Accept default path (C:\Users\<you>\.ssh\id_ed25519), set a passphrase.
 ```
 
-## 3) Configure environment
+### 1.3 Copy the key to the Pi
+```powershell
+type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh pi@raspberrypi.local "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+```
+Enter the Pi password once. Every subsequent `ssh pi@raspberrypi.local` uses
+the key.
 
-Copy `.env.example` (or create `.env`) with **strong, unique** values for every secret.
+### 1.4 (Optional) SSH shortcut
+Add to `C:\Users\<you>\.ssh\config`:
+```
+Host pi
+    HostName raspberrypi.local
+    User pi
+    IdentityFile ~/.ssh/id_ed25519
+```
+Then just: `ssh pi`.
 
-### Required secrets
-| Variable | Requirements |
-|---|---|
-| `TRANSCRIPT_VIEWER_AUTH_USERNAME` | Your login username |
-| `TRANSCRIPT_VIEWER_AUTH_PASSWORD` | **≥ 16 characters**, random |
-| `TRANSCRIPT_VIEWER_AUTH_SESSION_SECRET` | **≥ 64 hex chars** — generate with `python -c "import secrets; print(secrets.token_hex(32))"` |
-| `TRANSCRIPT_VIEWER_CAST_SIGNING_KEY` | **≥ 64 hex chars**, different from session secret — generate with `python -c "import secrets; print(secrets.token_hex(32))"` |
+---
 
-### Security settings for production
+## 2) One-time Pi setup
+
+### 2.1 Install Docker + Compose plugin
+```powershell
+ssh pi@raspberrypi.local "curl -fsSL https://get.docker.com | sh && sudo usermod -aG docker pi"
+```
+Log out and back in for the group to apply:
+```powershell
+ssh pi@raspberrypi.local "docker version && docker compose version"
+```
+
+### 2.2 Create project layout
+```powershell
+ssh pi@raspberrypi.local "mkdir -p /home/pi/echoai/downloads /home/pi/echoai/transcripts"
+```
+
+### 2.3 Log in to GHCR (for pulling the private image + Watchtower auth)
+Create a GitHub Personal Access Token with `read:packages` scope, then:
+```powershell
+ssh pi@raspberrypi.local "echo <GITHUB_PAT> | docker login ghcr.io -u <GITHUB_USERNAME> --password-stdin"
+```
+This writes `/home/pi/.docker/config.json`, which `docker-compose.yml` mounts
+into Watchtower.
+
+---
+
+## 3) Configure `.env`
+
+The app reads its configuration from `/home/pi/echoai/.env`. Every setting is
+prefixed `TRANSCRIPT_VIEWER_`.
+
+### 3.1 Generate secrets (run on Windows)
+```powershell
+python -c "import secrets; print('AUTH_PASSWORD =', secrets.token_urlsafe(24))"
+python -c "import secrets; print('AUTH_SESSION_SECRET =', secrets.token_hex(32))"
+python -c "import secrets; print('CAST_SIGNING_KEY =', secrets.token_hex(32))"
+```
+The three values MUST be independent — never reuse one as another.
+`_validate_secrets()` at startup logs `SECURITY:` warnings on weak or reused
+values.
+
+### 3.2 Required variables
+
+| Variable | Value | Notes |
+|---|---|---|
+| `TRANSCRIPT_VIEWER_AUTH_USERNAME` | your login name | non-empty |
+| `TRANSCRIPT_VIEWER_AUTH_PASSWORD` | ≥ 16 chars, random | from generator above |
+| `TRANSCRIPT_VIEWER_AUTH_SESSION_SECRET` | ≥ 64 hex chars | independent secret |
+| `TRANSCRIPT_VIEWER_CAST_SIGNING_KEY` | ≥ 64 hex chars | independent secret |
+| `TRANSCRIPT_VIEWER_CAST_RECEIVER_APP_ID` | your Cast receiver app id | required for Chromecast UI |
+
+### 3.3 Production settings (must be exactly these values)
 ```dotenv
-# Lock down cookies for HTTPS (Cloudflare terminates TLS)
-TRANSCRIPT_VIEWER_COOKIE_SECURE=1
-
-# Require signed token for Cast media requests
-TRANSCRIPT_VIEWER_CAST_TOKEN_REQUIRED_FOR_MEDIA=1
-
-# Auth must be enabled in production
 TRANSCRIPT_VIEWER_AUTH_DISABLED=0
+TRANSCRIPT_VIEWER_COOKIE_SECURE=1
+TRANSCRIPT_VIEWER_CAST_TOKEN_REQUIRED_FOR_MEDIA=1
 ```
 
-> **Critical:** Each secret (`AUTH_PASSWORD`, `AUTH_SESSION_SECRET`, `CAST_SIGNING_KEY`) must be **independent** — never reuse one as another. The server logs warnings at startup if it detects weak or reused secrets.
+### 3.4 Optional overrides (defaults shown in `.env.example`)
 
-### Generate strong secrets (run on any machine with Python)
+| Variable | Default | Purpose |
+|---|---|---|
+| `TRANSCRIPT_VIEWER_HOST` | `0.0.0.0` | Container listen address. |
+| `TRANSCRIPT_VIEWER_PORT` | `5000` | Container listen port. |
+| `TRANSCRIPT_VIEWER_DOWNLOADS_DIR` | `/app/downloads` | Path inside container. |
+| `TRANSCRIPT_VIEWER_TRANSCRIPTS_DIR` | `/app/transcripts` | Path inside container. |
+| `TRANSCRIPT_VIEWER_STATIC_DIR` | `/app/echoai/viewer` | Path inside container. |
+| `TRANSCRIPT_VIEWER_SPACY_MODEL` | `de_core_news_sm` | Keep `sm` on Pi (memory limit). |
+| `TRANSCRIPT_VIEWER_AUTH_SESSION_TTL_SECONDS` | `86400` | 24h session lifetime. |
+| `TRANSCRIPT_VIEWER_CAST_TOKEN_TTL_SECONDS` | `10800` | 3h — must exceed longest episode. See `docs/CHROMECAST.md`. |
+| `TRANSCRIPT_VIEWER_LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR`. |
+| `TRANSCRIPT_VIEWER_LOG_FILE` | `/tmp/echoai.log` | Backs the `/logs` page. **Must stay under `/tmp`** — the container root filesystem is read-only. Empty disables file logging. |
+| `TRANSCRIPT_VIEWER_LOG_MAX_BYTES` | `2000000` | Rotate at this size. |
+| `TRANSCRIPT_VIEWER_LOG_BACKUP_COUNT` | `3` | Rotated files kept. Total disk ≈ `MAX_BYTES × (COUNT + 1)`. |
+
+### 3.5 Copy `.env` to the Pi and lock it down
+Fill in `.env` locally on Windows, then:
 ```powershell
-python -c "import secrets; print('AUTH_PASSWORD:', secrets.token_urlsafe(20))"
-python -c "import secrets; print('AUTH_SESSION_SECRET:', secrets.token_hex(32))"
-python -c "import secrets; print('CAST_SIGNING_KEY:', secrets.token_hex(32))"
-```
-
-## 4) Secure the .env file
-
-After copying `.env` to the Pi, restrict permissions so only the `pi` user can read it:
-
-```bash
-chown pi:pi /home/pi/echoai/.env
-chmod 600 /home/pi/echoai/.env
-```
-
-> Docker Compose reads `.env` as the `pi` user. The container receives values via environment injection — it never mounts the file.
-
-## 5) Login to GHCR on Pi
-
-```bash
-echo <GITHUB_PAT> | docker login ghcr.io -u <GITHUB_USERNAME> --password-stdin
-```
-
-This writes `/home/pi/.docker/config.json` for Watchtower to use.
-
-## 6) Deploy service
-
-From your Windows machine (PowerShell), copy config and data:
-```powershell
-scp C:\Users\mnste\PycharmProjects\easygerman\docker-compose.yml pi@raspberrypi.local:/home/pi/echoai/
-scp C:\Users\mnste\PycharmProjects\easygerman\.env pi@raspberrypi.local:/home/pi/echoai/
-scp -r C:\Users\mnste\PycharmProjects\easygerman\downloads\* pi@raspberrypi.local:/home/pi/echoai/downloads/
-scp -r C:\Users\mnste\PycharmProjects\easygerman\transcripts\* pi@raspberrypi.local:/home/pi/echoai/transcripts/
-```
-
-Secure `.env` on the Pi:
-```bash
+scp .env pi@raspberrypi.local:/home/pi/echoai/.env
 ssh pi@raspberrypi.local "chown pi:pi /home/pi/echoai/.env && chmod 600 /home/pi/echoai/.env"
 ```
+`chmod 600` is required — `_validate_secrets()` and the pre-commit `.env`
+scan will flag looser modes.
 
-Start the stack:
-```bash
+---
+
+## 4) Copy `docker-compose.yml` and content
+
+From the project root on Windows:
+```powershell
+scp docker-compose.yml pi@raspberrypi.local:/home/pi/echoai/
+scp -r downloads\* pi@raspberrypi.local:/home/pi/echoai/downloads/
+scp -r transcripts\* pi@raspberrypi.local:/home/pi/echoai/transcripts/
+```
+Both content directories are mounted **read-only** inside the container.
+
+---
+
+## 5) Start the stack
+
+```powershell
 ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose pull && docker compose up -d"
 ```
 
-## 7) Verify runtime
-
-```bash
+Verify:
+```powershell
 ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose ps"
 ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose logs --tail=100 echoai"
 ```
+Look for `SECURITY:` warnings — any means a secret is weak, reused, or
+missing. Rotate before going live.
 
-Check for any `SECURITY:` warnings in the logs — these indicate weak or reused secrets that must be rotated.
+Open: `https://echoai.innovisionlabs.co.uk/`
 
-Open in browser: `https://echoai.innovisionlabs.co.uk/`
+**The browser will show its own sign-in dialog before the page loads.** The app
+shell is gated by HTTP Basic auth, so nothing renders until you authenticate;
+after that a normal session cookie takes over and the page's API calls work
+without re-entering credentials.
 
-## 8) Security checklist for production
+The one deliberate exception is `/?mode=receiver`, which the Chromecast fetches.
+A TV has no cookie jar and cannot answer a Basic challenge, so that URL serves
+the shell unauthenticated — safe, because the shell is static markup and every
+API call the receiver then makes still needs a signed cast token.
 
-Run through this checklist after every deployment:
+---
 
-- [ ] `.env` has `chmod 600` — only `pi` user can read
-- [ ] `TRANSCRIPT_VIEWER_AUTH_DISABLED=0` — auth is enforced
-- [ ] `TRANSCRIPT_VIEWER_COOKIE_SECURE=1` — cookies only over HTTPS
-- [ ] `TRANSCRIPT_VIEWER_CAST_TOKEN_REQUIRED_FOR_MEDIA=1` — media requires auth
-- [ ] All three secrets are **unique**, **≥ 16 chars** (password) / **≥ 64 hex chars** (keys)
-- [ ] No `SECURITY:` warnings in `docker compose logs`
-- [ ] Port `5000` is bound to `127.0.0.1` (not exposed externally — Cloudflare tunnel handles access)
-- [ ] Data volumes are mounted read-only (`:ro` in docker-compose.yml)
-- [ ] Container runs as non-root (`appuser`)
-- [ ] `read_only: true`, `no-new-privileges`, `cap_drop: ALL` are set
+## 6) Day-to-day operations (from Windows)
 
-## 9) Secret rotation
+All commands are single-line `ssh` invocations so you can paste them straight
+into PowerShell.
 
-If any secret is compromised or was ever committed to git:
+### Status & logs
+```powershell
+# Container status
+ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose ps"
 
-1. Generate new values (see section 3)
-2. Update `.env` on the Pi
-3. Restart: `docker compose restart echoai`
-4. All existing sessions are invalidated immediately (they're in-memory)
+# Tail live logs (Ctrl+C to exit)
+ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose logs -f echoai"
 
-## 10) Update/rollback operations
+# Last 200 lines
+ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose logs --tail=200 echoai"
 
-Update to latest image:
-```bash
+# Watchtower logs (image updates)
+ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose logs --tail=100 watchtower"
+```
+
+### The `/logs` page
+
+The app has a built-in log viewer at `https://echoai.innovisionlabs.co.uk/logs`.
+Prefer it over `docker compose logs` — it shows **both** server logs and logs
+shipped from the browser and the Chromecast receiver, with filters for level,
+source, and message text.
+
+This is the only way to see what the Chromecast did: a TV has no DevTools, so
+the receiver batches its own log lines to `POST /api/logs/client`, and they land
+in the same file as the server's.
+
+Access rules:
+- `/logs` — the page shell is public (it contains no log data) and prompts for login, exactly like `/`.
+- `GET /api/logs` — **session only**. A cast token is explicitly refused, because a token lives on a TV that anyone in the room can reach.
+- `POST /api/logs/client` — accepts a cast token, so the receiver can ship logs. Entry count, message length, and level are all clamped server-side.
+
+The log file itself:
+```powershell
+# Read it directly (it lives in the container's /tmp)
+ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose exec echoai cat /tmp/echoai.log"
+
+# Just the errors
+ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose exec echoai grep ERROR /tmp/echoai.log"
+
+# Check its size against the rotation cap
+ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose exec echoai ls -lh /tmp/"
+```
+
+> **Logs do not survive a restart.** `/tmp` is the only writable path in the
+> container (the root filesystem is `read_only: true`), so a redeploy or reboot
+> clears them. That is accepted — these are debugging logs, not an audit trail.
+
+**Log volume is bounded in three places.** All three are already set in
+`docker-compose.yml` / `.env.example`; check them if disk or memory looks wrong:
+
+| Bound | Where | Default | Protects |
+|---|---|---|---|
+| App log rotation | `TRANSCRIPT_VIEWER_LOG_MAX_BYTES` × `_BACKUP_COUNT` | ~8 MB | The `/tmp` filesystem |
+| `/tmp` size | `tmpfs: /tmp:size=64m` | 64 MB | **RAM** — tmpfs is memory and counts against `mem_limit: 512m` |
+| Docker capture | `logging.options.max-size/max-file` | 30 MB | The **SD card** — the json-file driver is unbounded by default |
+
+> The `/tmp` size cap matters more than it looks: tmpfs is RAM, not disk, so an
+> unbounded `/tmp` lets a runaway writer consume the container's whole 512 MB
+> and trigger an OOM kill.
+
+Client log ingestion (`POST /api/logs/client`) is rate-limited to
+`CLIENT_LOG_RATE_MAX_ENTRIES` per minute, so a misbehaving browser or receiver
+cannot flood genuine evidence out of the rotation window.
+
+To raise verbosity while chasing a bug, set `TRANSCRIPT_VIEWER_LOG_LEVEL=DEBUG`
+in `.env` and restart — then put it back, since DEBUG fills the rotation window
+much faster.
+
+### Resource check
+```powershell
+ssh pi@raspberrypi.local "docker stats --no-stream"
+ssh pi@raspberrypi.local "df -h /home && free -h"
+```
+
+### Restart / stop / start
+```powershell
+ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose restart echoai"
+ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose down"
+ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose up -d"
+```
+
+### Manual image update
+Normally Watchtower handles this. To force:
+```powershell
 ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose pull && docker compose up -d"
 ```
 
-Restart only app service:
-```bash
-ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose restart echoai"
+### Rollback to a specific version
+Edit the image tag in `docker-compose.yml` locally, then:
+```powershell
+scp docker-compose.yml pi@raspberrypi.local:/home/pi/echoai/
+ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose pull && docker compose up -d"
 ```
 
-Stop stack:
-```bash
-ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose down"
+### Sync new content
+```powershell
+# Add new MP3s
+scp downloads\*.mp3 pi@raspberrypi.local:/home/pi/echoai/downloads/
+
+# Add new transcripts
+scp transcripts\* pi@raspberrypi.local:/home/pi/echoai/transcripts/
 ```
+No restart needed — the Flask app reads the directories on each request.
+
+### Update `.env` (secret rotation, config change)
+```powershell
+scp .env pi@raspberrypi.local:/home/pi/echoai/.env
+ssh pi@raspberrypi.local "chmod 600 /home/pi/echoai/.env && cd /home/pi/echoai && docker compose up -d"
+```
+Restart invalidates all in-memory sessions — every user re-logs in.
+
+### Shell into the container (debug)
+```powershell
+ssh pi@raspberrypi.local "cd /home/pi/echoai && docker compose exec echoai sh"
+```
+The filesystem is read-only except `/tmp` — expect writes elsewhere to fail.
+
+### Reboot the Pi
+```powershell
+ssh pi@raspberrypi.local "sudo reboot"
+```
+Compose auto-starts on boot (`restart: unless-stopped`).
+
+---
+
+## 7) Security checklist (run after every deploy)
+
+- [ ] `.env` is `chmod 600`, owner `pi:pi`
+- [ ] `TRANSCRIPT_VIEWER_AUTH_DISABLED=0`
+- [ ] `TRANSCRIPT_VIEWER_COOKIE_SECURE=1`
+- [ ] `TRANSCRIPT_VIEWER_CAST_TOKEN_REQUIRED_FOR_MEDIA=1`
+- [ ] `AUTH_PASSWORD`, `AUTH_SESSION_SECRET`, `CAST_SIGNING_KEY` are all set and mutually distinct
+- [ ] No `SECURITY:` warnings in `docker compose logs echoai`
+- [ ] Compose exposes `127.0.0.1:5000` only, not `0.0.0.0`
+- [ ] `downloads/` and `transcripts/` are mounted `:ro`
+- [ ] Container has `read_only: true`, `no-new-privileges`, `cap_drop: ALL`
+- [ ] Memory 512M, PIDs 100 (defaults in `docker-compose.yml`)
+- [ ] `GET /api/logs` returns 401 when signed out (log viewer is session-only)
+- [ ] `TRANSCRIPT_VIEWER_LOG_FILE` is under `/tmp` — anywhere else fails on a read-only rootfs
+- [ ] `GET /` returns 401 with a `WWW-Authenticate: Basic` header when signed out
+- [ ] `GET /?mode=receiver` returns 200 — otherwise casting is broken
+- [ ] `tmpfs: /tmp` has an explicit `size=` (tmpfs is RAM, counted against `mem_limit`)
+- [ ] The `logging:` block is present on the service (Docker's default is unbounded)
+
+---
 
 ## Notes
-- Watchtower (if running) auto-updates labeled containers when new images are pushed.
-- The `/api/cast/debug` endpoint requires authentication — it exposes server diagnostics.
-- Port binding is `127.0.0.1:5000` — direct external access is blocked. Use Cloudflare Tunnel for public access.
-- Container memory is capped at 512 MB and 100 PIDs to prevent resource exhaustion.
+
+- Sessions are **in-memory** — any restart, redeploy, or Watchtower update logs everyone out.
+- Watchtower polls GHCR and restarts the labeled `echoai` container when a new image is published from `main` (prod) or `develop` (dev).
+- `/api/cast/debug` is authenticated — it exposes diagnostics; do not open it publicly.
+- The container listens on `127.0.0.1:5000`. Public traffic must go through Cloudflare Tunnel, which terminates TLS.
+- If `raspberrypi.local` doesn't resolve on your network, use the Pi's LAN IP: check with `ssh pi@raspberrypi.local "hostname -I"` once, then substitute.

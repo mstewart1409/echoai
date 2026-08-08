@@ -12,13 +12,14 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
+from logging.handlers import RotatingFileHandler
 
 import requests
 import spacy
 from pathlib import Path
 from dotenv import load_dotenv
 
-from flask import Flask, jsonify, make_response, request, send_from_directory
+from flask import Flask, g, jsonify, make_response, request, send_from_directory
 
 from echoai import __version__
 
@@ -65,6 +66,36 @@ CAST_TOKEN_REQUIRED_FOR_MEDIA = (
     os.getenv('TRANSCRIPT_VIEWER_CAST_TOKEN_REQUIRED_FOR_MEDIA', '0') == '1'
 )
 
+# ── Logging ──────────────────────────────────────────────────────────────────
+# The container root filesystem is read-only with only /tmp writable, so the
+# log file lives there by default. It is therefore lost on redeploy — that is
+# accepted: these are debugging logs, not an audit trail.
+LOG_LEVEL = os.getenv('TRANSCRIPT_VIEWER_LOG_LEVEL', 'INFO').strip().upper()
+LOG_FILE = os.getenv('TRANSCRIPT_VIEWER_LOG_FILE', '/tmp/echoai.log').strip()
+# Rotation keeps disk use bounded at roughly MAX_BYTES * (BACKUP_COUNT + 1).
+LOG_MAX_BYTES = env_int('TRANSCRIPT_VIEWER_LOG_MAX_BYTES', 2_000_000)
+LOG_BACKUP_COUNT = env_int('TRANSCRIPT_VIEWER_LOG_BACKUP_COUNT', 3)
+LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s %(message)s'
+
+# Caps for the log-viewing API. The viewer never streams the whole file.
+LOG_TAIL_MAX_BYTES = 2_000_000
+LOG_API_MAX_LINES = 2000
+LOG_API_DEFAULT_LINES = 500
+
+# Caps for client-side (browser / Chromecast) log ingestion.
+CLIENT_LOG_MAX_ENTRIES = 50
+CLIENT_LOG_MAX_MSG_LEN = 1000
+CLIENT_LOG_LEVELS = frozenset({'DEBUG', 'INFO', 'OK', 'WARN', 'ERROR'})
+# Flood ceiling: a client that spams logs would rotate real evidence out of the
+# file. Generous enough for genuine debugging, low enough to bound the damage.
+CLIENT_LOG_RATE_MAX_ENTRIES = 600
+CLIENT_LOG_RATE_WINDOW_SECONDS = 60
+
+# Largest request body accepted on ANY endpoint. Without this a single huge
+# POST is parsed into memory and can OOM the 512 MB container.
+MAX_CONTENT_LENGTH = 256 * 1024
+
+
 # Bounded caches — prevent unbounded memory growth.
 CACHE_MAX_SIZE = 10000
 AUTH_SESSIONS_MAX = 1000
@@ -81,9 +112,180 @@ _SAFE_EPISODE_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
 CAST_SCOPE_ANY = '_auth'
 
 # Routes a cast token must NOT unlock - they require a logged-in session.
-SESSION_ONLY_PATHS = frozenset({'/api/cast/session', '/api/cast/debug'})
+# The log viewer is in here deliberately: logs are diagnostics, and a cast
+# token lives on a TV that anyone in the room can reach.
+SESSION_ONLY_PATHS = frozenset({'/api/cast/session', '/api/cast/debug', '/api/logs'})
 
-logger = logging.getLogger(__name__)
+# Page shells gated by HTTP Basic auth, so the browser's own sign-in dialog
+# appears before any markup renders. Everything else authenticates by session
+# cookie or cast token.
+PAGE_SHELL_PATHS = frozenset({'/', '/logs'})
+
+# The ONLY path the Chromecast may fetch unauthenticated. Kept separate from
+# PAGE_SHELL_PATHS on purpose: the receiver exemption must not extend to /logs.
+RECEIVER_SHELL_PATH = '/'
+
+# Explicitly named rather than __name__: under `python -m echoai.transcript_viewer`
+# __name__ is '__main__', which would make server logs unfilterable by source in
+# the /logs viewer and inconsistent between run styles.
+logger = logging.getLogger('echoai.server')
+# Client (browser / Chromecast) logs shipped to /api/logs/client land here, so
+# they are distinguishable from server logs by name in the viewer.
+client_logger = logging.getLogger('echoai.client')
+
+# Query parameters whose values must never reach a log file. `rt` is a signed
+# cast token: logging it would hand out media access to anyone reading logs.
+_REDACTED_QUERY_KEYS = frozenset({'rt', 'token', 'password', 'secret', 'key'})
+# Matches a full log line written with LOG_FORMAT.
+_LOG_LINE_RE = re.compile(
+    r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})\s+'
+    r'(?P<level>[A-Z]+)\s+'
+    r'(?P<name>\S+)\s+'
+    r'(?P<message>.*)$'
+)
+
+
+REDACTED = '<redacted>'
+
+# Structural patterns for secrets, applied to every log line by RedactingFormatter.
+# Each is deliberately narrow enough not to eat ordinary values (episode ids,
+# filenames, versions, paths).
+_REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # key=value in a query string or body fragment: rt=..., password=..., token=...
+    (
+        re.compile(
+            r'\b(rt|token|password|passwd|secret|api_?key|signing_?key|sid|session)'
+            r'\s*[=:]\s*"?([^\s&"\',;]+)',
+            re.IGNORECASE,
+        ),
+        r'\1=' + REDACTED,
+    ),
+    # Authorization headers: "Bearer <token>" / "Basic <blob>".
+    (re.compile(r'\b(Bearer|Basic)\s+\S+', re.IGNORECASE), r'\1 ' + REDACTED),
+    # Cast token: base64url payload "." base64url signature. BOTH halves must be
+    # long, so "123_egp654.mp3" and "echoai.log" are untouched.
+    (re.compile(r'\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b'), REDACTED),
+    # Session ids and raw keys: any long hex run (a sha256 hexdigest is 64).
+    (re.compile(r'\b[0-9a-fA-F]{32,}\b'), REDACTED),
+)
+
+
+def _configured_secrets() -> list[str]:
+    """The live secret values, read at call time so tests and reloads stay correct.
+
+    Scrubbing by exact value is the backstop: even if a future call site logs
+    the real password, it never reaches the file. Short values are skipped — an
+    8-character floor stops a weak secret from redacting half of English.
+    """
+    return [s for s in (AUTH_PASSWORD, AUTH_SESSION_SECRET, CAST_SIGNING_KEY) if s and len(s) >= 8]
+
+
+def scrub_secrets(text: str) -> str:
+    """Remove anything secret-shaped from a log line.
+
+    Applied to every record by RedactingFormatter, so it covers the message,
+    its arguments, and any attached traceback — including logs shipped from the
+    browser and the Chromecast, which are entirely attacker-controlled.
+    """
+    if not text:
+        return text
+    for secret in _configured_secrets():
+        text = text.replace(secret, REDACTED)
+    for pattern, replacement in _REDACTION_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+class RedactingFormatter(logging.Formatter):
+    """Formatter that scrubs secrets from the fully rendered line.
+
+    The single chokepoint: every handler uses it, so no call site can leak by
+    forgetting to redact, and a traceback carrying a tokenised URL is covered
+    too (tracebacks render here, not in the record's own message).
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return scrub_secrets(super().format(record))
+
+
+# Every character Python's str.splitlines() treats as a line break, plus the C1
+# range and DEL. Stripping only \r\n is NOT enough: \x0b, \x0c, \x1c-\x1e, \x85,
+# U+2028 and U+2029 all split lines too, so a client could inject a fake
+# timestamped record into the log file and forge entries attributed to any
+# logger. \x1b is in here as well, which also neutralises ANSI escape sequences
+# that would otherwise rewrite the terminal of anyone running `docker logs`.
+_UNSAFE_LOG_CHARS_RE = re.compile(r'[\x00-\x1f\x7f-\x9f\u2028\u2029]')
+
+
+def sanitize_log_text(text: str) -> str:
+    """Make attacker-supplied text safe to write as a single log record."""
+    return _UNSAFE_LOG_CHARS_RE.sub(' ', text)
+
+
+def _redact_query(query: str) -> str:
+    """Blank the values of sensitive query parameters before logging a URL."""
+    if not query:
+        return ''
+    parts = []
+    for pair in query.split('&'):
+        key, sep, _value = pair.partition('=')
+        if sep and key.lower() in _REDACTED_QUERY_KEYS:
+            parts.append(f'{key}={REDACTED}')
+        else:
+            parts.append(pair)
+    return '&'.join(parts)
+
+
+def _configure_logging() -> None:
+    """Send logs to stderr and, when possible, to a rotating file for the viewer.
+
+    A failure to open the log file is never fatal — the app must still serve
+    even on a filesystem where the configured path is not writable.
+    """
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    file_error: str | None = None
+    if LOG_FILE:
+        try:
+            Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+            handlers.append(
+                RotatingFileHandler(
+                    LOG_FILE,
+                    maxBytes=LOG_MAX_BYTES,
+                    backupCount=LOG_BACKUP_COUNT,
+                    encoding='utf-8',
+                )
+            )
+        except OSError as exc:
+            file_error = f'{type(exc).__name__}: {exc}'
+
+    formatter = RedactingFormatter(LOG_FORMAT)
+    for handler in handlers:
+        handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(LOG_LEVEL if LOG_LEVEL in logging.getLevelNamesMapping() else 'INFO')
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    for handler in handlers:
+        root.addHandler(handler)
+
+    if file_error:
+        logger.warning('log file %s unavailable (%s) — console only', LOG_FILE, file_error)
+    else:
+        logger.info(
+            'logging to %s (level=%s, rotate=%d bytes x %d)',
+            LOG_FILE or '<console only>',
+            LOG_LEVEL,
+            LOG_MAX_BYTES,
+            LOG_BACKUP_COUNT,
+        )
+
+    # Werkzeug's access log writes the RAW request line, query string and all.
+    # Media URLs carry a signed cast token in `rt`, so leaving it enabled would
+    # write live media credentials into a file the /logs page serves back out.
+    # log_request() above already covers every request, with the query redacted
+    # and a duration attached, so this only silences a leaky duplicate.
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 
 def _validate_episode_id(episode_id: str) -> str | None:
@@ -132,6 +334,10 @@ VIEWER_DIR = _pick_dir(
 )
 
 app = Flask(__name__, static_folder=str(VIEWER_DIR), static_url_path='/static')
+# Reject oversized bodies before Flask parses them into memory. Every POST this
+# app accepts is small (credentials, a log batch, an episode id), so a body
+# above this is either a bug or an attempt to exhaust the 512 MB container.
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
 # Host sources are deliberately scheme-less: the Cast SDK <script> URLs are
 # protocol-relative (Google's documented best practice), so pinning https:// here
@@ -353,18 +559,109 @@ def _extract_cast_token_from_request() -> str:
 
 
 @app.before_request
+def start_request_timer():
+    """Stamp the request so after_request can report how long it took."""
+    request.environ['echoai.start_time'] = time.monotonic()
+
+
+@app.after_request
+def log_request(response):
+    """One line per request — the backbone of after-the-fact debugging.
+
+    Query strings are redacted: media URLs carry a signed cast token in `rt`,
+    and a log file is not a place to store credentials.
+    """
+    started = request.environ.get('echoai.start_time')
+    duration_ms = (time.monotonic() - started) * 1000 if started else -1
+    query = _redact_query(request.query_string.decode('utf-8', 'replace'))
+    # 4xx/5xx are the interesting ones — surface them above INFO noise.
+    level = logging.WARNING if response.status_code >= 400 else logging.INFO
+    logger.log(
+        level,
+        '%s %s%s → %d (%.0fms) from %s',
+        request.method,
+        request.path,
+        f'?{query}' if query else '',
+        response.status_code,
+        duration_ms,
+        request.remote_addr or '-',
+    )
+    return response
+
+
+def _is_receiver_shell_request() -> bool:
+    """Is this the Chromecast fetching the app shell?
+
+    The receiver runs on a TV: it has no cookie jar and no way to answer a Basic
+    auth challenge, so the shell must stay reachable for it. That is safe — the
+    shell is static markup with no episode data, and every API call it then
+    makes still needs a signed cast token.
+    """
+    return request.args.get('mode') == 'receiver' or request.args.get('receiver') == '1'
+
+
+def _validate_basic_auth() -> bool:
+    """Check an HTTP Basic Authorization header against the configured credentials.
+
+    Lets the browser put its native sign-in dialog in front of the page, so the
+    app shell never renders for an unauthenticated visitor.
+    """
+    header = request.headers.get('Authorization', '')
+    if not header.startswith('Basic '):
+        return False
+    try:
+        decoded = base64.b64decode(header[6:].strip(), validate=True).decode('utf-8')
+    except ValueError, binascii.Error, UnicodeDecodeError:
+        return False
+    username, sep, password = decoded.partition(':')
+    if not sep:
+        return False
+    return _validate_login_credentials(username.strip(), password.strip())
+
+
+def _basic_auth_challenge():
+    """401 that makes the browser show its own login dialog."""
+    response = make_response(jsonify({'error': 'authentication required'}), 401)
+    response.headers['WWW-Authenticate'] = 'Basic realm="echoai", charset="UTF-8"'
+    return response
+
+
+@app.before_request
 def require_authentication():
     if AUTH_DISABLED:
         return None
 
-    # Public entry points for loading the app shell and creating sessions.
-    if request.path == '/' or request.path.startswith('/static/'):
+    # Static assets stay public: the Chromecast receiver needs the CSS and JS,
+    # and they contain no episode data.
+    if request.path.startswith('/static/'):
         return None
 
     if request.path in ('/api/auth/status', '/api/auth/login'):
         return None
 
     if _validate_auth_session():
+        return None
+
+    # Page shells are gated by HTTP Basic so nothing renders before sign-in.
+    # On success we mint a session cookie (see _issue_session_after_basic_auth)
+    # so the page's own API calls work without re-sending credentials.
+    if request.path in PAGE_SHELL_PATHS:
+        # The receiver exemption applies to the viewer shell ONLY. Scoping it to
+        # PAGE_SHELL_PATHS as a whole let `/logs?mode=receiver` walk straight
+        # past the gate — and the Chromecast never loads /logs.
+        if request.path == RECEIVER_SHELL_PATH and _is_receiver_shell_request():
+            return None
+        if not _has_auth_credentials_configured():
+            # Nothing to check against — challenging would lock the app shut.
+            return None
+        if _validate_basic_auth():
+            g.issue_session_for = AUTH_USERNAME
+            return None
+        return _basic_auth_challenge()
+
+    # Basic credentials are accepted on API calls too, so a client that already
+    # answered the browser dialog is not forced through a second login.
+    if _validate_basic_auth():
         return None
 
     # A cast token authenticates the receiver for content only. It must never
@@ -378,6 +675,30 @@ def require_authentication():
         return None
 
     return _auth_required_response()
+
+
+@app.after_request
+def _issue_session_after_basic_auth(response):
+    """Convert a successful Basic auth on a page load into a normal session cookie.
+
+    Without this the browser would have to attach credentials to every XHR the
+    page makes; with it, Basic auth is a one-time gate and everything after runs
+    on the same session mechanism as a form login.
+    """
+    username = getattr(g, 'issue_session_for', None)
+    if not username:
+        return response
+    sid, _expires_at = _new_auth_session(username)
+    response.set_cookie(
+        AUTH_SESSION_COOKIE_NAME,
+        sid,
+        max_age=max(300, AUTH_SESSION_TTL_SECONDS),
+        httponly=True,
+        samesite='Lax',
+        secure=COOKIE_SECURE,
+    )
+    logger.info('auth: session issued via Basic auth for username=%r', username[:64])
+    return response
 
 
 @app.get('/api/auth/status')
@@ -402,9 +723,17 @@ def api_auth_login():
     username = str(payload.get('username', '')).strip()
     password = str(payload.get('password', '')).strip()
     if not _validate_login_credentials(username, password):
+        # Username and source address only — never the password, and never the
+        # session id that a success would create.
+        logger.warning(
+            'auth: failed login for username=%r from %s', username[:64], request.remote_addr or '-'
+        )
         return jsonify({'error': 'invalid credentials'}), 401
 
     sid, expires_at = _new_auth_session(username)
+    logger.info(
+        'auth: login succeeded for username=%r from %s', username[:64], request.remote_addr or '-'
+    )
     response = make_response(jsonify({'ok': True, 'expires_at': expires_at}))
     response.set_cookie(
         AUTH_SESSION_COOKIE_NAME,
@@ -1050,6 +1379,183 @@ def static_files(filename: str):
     return send_from_directory(VIEWER_DIR, filename)
 
 
+# ── Log viewing ──────────────────────────────────────────────────────────────
+
+# OK is a client-only level; everything else maps to its logging equivalent.
+_CLIENT_LEVEL_TO_LOGGING = {
+    'DEBUG': logging.DEBUG,
+    'INFO': logging.INFO,
+    'OK': logging.INFO,
+    'WARN': logging.WARNING,
+    'ERROR': logging.ERROR,
+}
+
+# Fixed-window flood guard for client log ingestion. Deliberately global rather
+# than per-IP: a per-IP dict is unbounded state keyed by attacker input, which
+# is the very thing this codebase forbids.
+_client_log_window_start = 0.0
+_client_log_window_count = 0
+_CLIENT_LOG_RATE_LOCK = threading.Lock()
+
+
+def _client_log_rate_limit_ok() -> bool:
+    """Consume one slot from the current window. False once the ceiling is hit."""
+    global _client_log_window_start, _client_log_window_count
+    now = time.monotonic()
+    with _CLIENT_LOG_RATE_LOCK:
+        if now - _client_log_window_start >= CLIENT_LOG_RATE_WINDOW_SECONDS:
+            _client_log_window_start = now
+            _client_log_window_count = 0
+        if _client_log_window_count >= CLIENT_LOG_RATE_MAX_ENTRIES:
+            return False
+        _client_log_window_count += 1
+        return True
+
+
+def _read_log_tail(max_bytes: int = LOG_TAIL_MAX_BYTES) -> list[str]:
+    """Return the last `max_bytes` of the log file as lines, oldest first.
+
+    Reads only the tail so a rotated-but-large file can never blow the Pi's
+    512 MB budget. The first line is dropped when the file was truncated, as
+    it is almost certainly a partial record.
+    """
+    if not LOG_FILE:
+        return []
+    path = Path(LOG_FILE)
+    try:
+        size = path.stat().st_size
+        with path.open('rb') as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+                handle.readline()  # discard the partial first line
+            raw = handle.read()
+    except OSError:
+        logger.exception('could not read log file %s', LOG_FILE)
+        return []
+    return raw.decode('utf-8', 'replace').splitlines()
+
+
+def parse_log_lines(lines: list[str]) -> list[dict[str, str]]:
+    """Turn raw log lines into records, folding continuation lines into the previous one.
+
+    A traceback is many physical lines but one logical record — attaching it to
+    its parent keeps stack traces readable and filterable in the viewer.
+    """
+    records: list[dict[str, str]] = []
+    for line in lines:
+        match = _LOG_LINE_RE.match(line)
+        if match:
+            records.append(match.groupdict())
+        elif records:
+            records[-1]['message'] += '\n' + line
+        # A continuation with no parent (start of a truncated file) is dropped.
+    return records
+
+
+def filter_log_records(
+    records: list[dict[str, str]],
+    levels: set[str] | None = None,
+    search: str = '',
+    source: str = '',
+) -> list[dict[str, str]]:
+    """Apply the viewer's filters. All are case-insensitive and optional."""
+    needle = search.strip().lower()
+    source = source.strip().lower()
+    result = []
+    for record in records:
+        if levels and record['level'] not in levels:
+            continue
+        if source and source not in record['name'].lower():
+            continue
+        if needle and needle not in record['message'].lower():
+            continue
+        result.append(record)
+    return result
+
+
+@app.get('/logs')
+def logs_page():
+    """Serve the log viewer shell.
+
+    Deliberately public, exactly like `/`: this file contains no log data. Every
+    byte of actual log content comes from /api/logs, which is in
+    SESSION_ONLY_PATHS and so needs a real logged-in session.
+    """
+    return send_from_directory(VIEWER_DIR, 'logs.html')
+
+
+@app.get('/api/logs')
+def api_logs():
+    """Return filtered log records, newest last. Session-only — see SESSION_ONLY_PATHS."""
+    limit = max(1, min(env_int_arg('limit', LOG_API_DEFAULT_LINES), LOG_API_MAX_LINES))
+    search = (request.args.get('search') or '')[:200]
+    source = (request.args.get('source') or '')[:100]
+    raw_levels = (request.args.get('levels') or '').strip().upper()
+    levels = {part for part in raw_levels.split(',') if part} or None
+
+    records = filter_log_records(parse_log_lines(_read_log_tail()), levels, search, source)
+    total = len(records)
+    return jsonify(
+        {
+            'records': records[-limit:],
+            'total': total,
+            'returned': min(total, limit),
+            'log_file': LOG_FILE,
+            'level': LOG_LEVEL,
+        }
+    )
+
+
+@app.post('/api/logs/client')
+def api_logs_client():
+    """Ingest browser / Chromecast logs so TV-side failures are visible on the Pi.
+
+    Reachable with a cast token on purpose: the receiver runs on a Chromecast
+    with no cookies and no DevTools, and its logs are the only window into Cast
+    playback bugs.
+
+    Everything in the body is attacker-controlled, so it is treated as hostile:
+    the body size is capped by MAX_CONTENT_LENGTH, the batch is truncated, each
+    message is length-clamped and stripped of every character that could forge a
+    new log record, the level is whitelisted, and a rate limit stops a flood
+    from rotating real evidence out of the file.
+    """
+    if not _client_log_rate_limit_ok():
+        # 429 rather than a silent drop, so a misbehaving client can back off.
+        return jsonify({'error': 'log rate limit exceeded'}), 429
+
+    payload = request.get_json(silent=True) or {}
+    entries = payload.get('entries')
+    if not isinstance(entries, list):
+        return jsonify({'error': 'entries must be a list'}), 400
+
+    source = sanitize_log_text(str(payload.get('source', 'client'))[:20]) or 'client'
+    accepted = 0
+    for entry in entries[:CLIENT_LOG_MAX_ENTRIES]:
+        if not isinstance(entry, dict):
+            continue
+        level = str(entry.get('level', 'INFO')).strip().upper()
+        if level not in CLIENT_LOG_LEVELS:
+            level = 'INFO'
+        message = sanitize_log_text(str(entry.get('msg', ''))[:CLIENT_LOG_MAX_MSG_LEN]).strip()
+        if not message:
+            continue
+        # OK is a client-only level with no logging equivalent; it maps to INFO.
+        client_logger.log(
+            _CLIENT_LEVEL_TO_LOGGING.get(level, logging.INFO), '[%s] %s', source, message
+        )
+        accepted += 1
+    return jsonify({'accepted': accepted})
+
+
+def env_int_arg(name: str, default: int) -> int:
+    """Read an integer query parameter, falling back to the default on anything unusable."""
+    try:
+        return int(request.args.get(name, ''))
+    except TypeError, ValueError:
+        return default
+
+
 def _validate_secrets() -> None:
     """Warn at startup if secrets are weak or reused.
 
@@ -1084,10 +1590,7 @@ def main() -> None:
 
     # Without this the module's logger.info/warning calls are dropped, so the
     # SECURITY: warnings the deployment guide tells you to check never appear.
-    logging.basicConfig(
-        level=os.getenv('TRANSCRIPT_VIEWER_LOG_LEVEL', 'INFO').upper(),
-        format='%(asctime)s %(levelname)s %(name)s %(message)s',
-    )
+    _configure_logging()
 
     _validate_secrets()
 
@@ -1095,7 +1598,16 @@ def main() -> None:
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
+    logger.info(
+        'echoai %s starting — downloads=%s transcripts=%s auth_disabled=%s cast_token_required=%s',
+        __version__,
+        DOWNLOADS_DIR,
+        TRANSCRIPTS_DIR,
+        AUTH_DISABLED,
+        CAST_TOKEN_REQUIRED_FOR_MEDIA,
+    )
     logger.info('Viewer: http://%s:%d', args.host, args.port)
+    logger.info('Logs:   http://%s:%d/logs', args.host, args.port)
     app.run(host=args.host, port=args.port, debug=False)
 
 

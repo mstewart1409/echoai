@@ -80,9 +80,16 @@ function makeElement(name, log) {
 async function loadApp(search = '') {
   const listeners = [];
   const fetchCalls = [];
+  // Memoized so a test can grab the very element app.js captured (audioEl is a
+  // top-level const — the only way to influence it is to mutate that object).
+  const elements = new Map();
+  const getElement = (id) => {
+    if (!elements.has(id)) elements.set(id, makeElement(id, listeners));
+    return elements.get(id);
+  };
 
   const document = {
-    getElementById: (id) => makeElement(id, listeners),
+    getElementById: getElement,
     createElement: (tag) => makeElement(`<${tag}>`, listeners),
     createTextNode: (t) => ({ nodeType: 3, textContent: t }),
     querySelectorAll: () => [],
@@ -150,7 +157,7 @@ async function loadApp(search = '') {
   // `function` declarations land on the sandbox global, but top-level `let`
   // bindings do not — mutating those needs code evaluated inside the context.
   const evalIn = (src) => vm.runInContext(src, context);
-  return { listeners, fetchCalls, error, sandbox, evalIn };
+  return { listeners, fetchCalls, error, sandbox, evalIn, getElement };
 }
 
 test('app.js parses and executes without a ReferenceError', async () => {
@@ -306,4 +313,113 @@ test('buildSegmentWordRanges tolerates empty input and out-of-range indices', as
   // A word pointing past the end of the segment list must be ignored, not throw.
   const ranges = sandbox.buildSegmentWordRanges([{ text: 'a' }], [{ segment_index: 9 }]);
   assertSameShape(ranges, [{ start: 0, end: -1 }]);
+});
+
+test('castShouldSnap corrects the pause overshoot regardless of play state', async () => {
+  // On pause the local muted audioEl keeps running for the Cast round-trip and
+  // halts ~1-2s ahead of the receiver. The old code only snapped when paused if
+  // drift > 2s, so that overshoot survived until resume and the transcript
+  // highlight started ~2s ahead of the audio. One threshold, always applied.
+  const { sandbox, error } = await loadApp();
+  assert.equal(error, null);
+
+  assert.equal(sandbox.castShouldSnap(100, 100), false, 'identical times must not snap');
+  assert.equal(sandbox.castShouldSnap(100.3, 100), false, 'sub-tolerance drift must not snap');
+  // The regression: a 1.5s pause overshoot must be corrected, not ignored.
+  assert.equal(sandbox.castShouldSnap(101.5, 100), true, 'pause overshoot must snap');
+  assert.equal(sandbox.castShouldSnap(100, 101.5), true, 'drift is symmetric');
+});
+
+// ── Cast reconciler ──────────────────────────────────────────────────────────
+//
+// reconcileLocalToRemote() is the single owner of audioEl's clock and play
+// state while casting. Every sync bug in this file's history was two handlers
+// fighting over that ownership, so these tests pin its policy directly.
+
+/**
+ * Boot app.js into an active casting state.
+ * @param remote - fields for the stubbed RemotePlayer (the receiver)
+ * @param local  - { time, paused } for the sender's muted audioEl
+ */
+async function loadCastingApp(remote, local) {
+  const { sandbox, evalIn, getElement, error } = await loadApp();
+  assert.equal(error, null);
+
+  const audio = getElement('audioPlayer');
+  audio.src = 'episode.mp3';
+  audio.currentTime = local.time;
+  audio.paused = local.paused;
+  audio.play = () => { audio.paused = false; return Promise.resolve(); };
+  audio.pause = () => { audio.paused = true; };
+
+  // castSession + remotePlayerController make _isCasting() true.
+  evalIn(`
+    castSession = {};
+    remotePlayerController = {};
+    remotePlayer = ${JSON.stringify(remote)};
+  `);
+  return { sandbox, evalIn, audio };
+}
+
+const LIVE = { currentTime: 100, duration: 500, isPaused: false };
+const STOPPED = { currentTime: 100, duration: 500, isPaused: true };
+
+test('reconciler snaps the local clock to the receiver while paused', async () => {
+  // The pause overshoot: local halted 1.5s ahead of where the receiver stopped.
+  // It must be corrected while paused, or resume starts out of sync.
+  const { sandbox, audio } = await loadCastingApp(STOPPED, { time: 101.5, paused: true });
+  sandbox.reconcileLocalToRemote('test');
+  assert.equal(audio.currentTime, 100, 'local must converge on the receiver');
+  assert.equal(audio.paused, true, 'local must stay paused with the receiver');
+});
+
+test('reconciler leaves sub-tolerance drift alone', async () => {
+  const { sandbox, audio } = await loadCastingApp(LIVE, { time: 100.2, paused: false });
+  sandbox.resetRemoteClockGrace(Date.now());
+  sandbox.reconcileLocalToRemote('test');
+  assert.equal(audio.currentTime, 100.2, 'no snap inside tolerance — avoids jitter');
+});
+
+test('reconciler does not resurrect local playback against a frozen receiver', async () => {
+  // The 1s loop: a receiver-side pause can leave isPaused reading false while
+  // the clock freezes. Restarting local playback then snapping it back replays
+  // the same second forever. A stalled clock must win over the flag.
+  const { sandbox, audio } = await loadCastingApp(LIVE, { time: 100, paused: true });
+  // Age the clock past the stall timeout without it ever moving.
+  sandbox.noteRemoteClock(100, Date.now() - 5000);
+  sandbox.reconcileLocalToRemote('test');
+  assert.equal(audio.paused, true, 'must not resurrect against a frozen receiver');
+});
+
+test('reconciler resumes local playback for a genuinely advancing receiver', async () => {
+  const { sandbox, audio } = await loadCastingApp(LIVE, { time: 100, paused: true });
+  sandbox.resetRemoteClockGrace(Date.now());
+  sandbox.reconcileLocalToRemote('test');
+  assert.equal(audio.paused, false, 'a live receiver must pull local playback along');
+});
+
+test('reconciler pauses local playback when the receiver pauses', async () => {
+  const { sandbox, audio } = await loadCastingApp(STOPPED, { time: 100, paused: false });
+  sandbox.resetRemoteClockGrace(Date.now());
+  sandbox.reconcileLocalToRemote('test');
+  assert.equal(audio.paused, true, 'local must follow the receiver into pause');
+});
+
+test('reconciler is inert without an active Cast session', async () => {
+  // Guard clauses matter: on the receiver the Cast framework owns audioEl, and
+  // a stray reconcile would fight it.
+  const { sandbox, evalIn, audio } = await loadCastingApp(LIVE, { time: 999, paused: true });
+  evalIn('castSession = null;');
+  sandbox.reconcileLocalToRemote('test');
+  assert.equal(audio.currentTime, 999, 'must not touch audioEl without a session');
+  assert.equal(audio.paused, true);
+});
+
+test('reconciler ignores a receiver with no duration yet', async () => {
+  // duration <= 0 means media has not loaded; its currentTime of 0 is not a
+  // real position and snapping to it would rewind the sender to the start.
+  const noMedia = { currentTime: 0, duration: 0, isPaused: false };
+  const { sandbox, audio } = await loadCastingApp(noMedia, { time: 50, paused: false });
+  sandbox.reconcileLocalToRemote('test');
+  assert.equal(audio.currentTime, 50, 'must not rewind against unloaded media');
 });
